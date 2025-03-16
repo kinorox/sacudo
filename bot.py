@@ -180,7 +180,7 @@ async def update_music_message(ctx, player):
     current_song_message[guild_id] = msg  # Store the new message reference
 
 async def play_next(ctx):
-    """Plays the next song in the queue."""
+    """Plays the next song in the queue or updates the message if queue is empty."""
     if ctx.guild.id in queues and queues[ctx.guild.id]:
         while queues[ctx.guild.id]:
             next_url = queues[ctx.guild.id].popleft()
@@ -195,6 +195,14 @@ async def play_next(ctx):
                 return
             except YTDLError:
                 continue  # Skip to next song silently
+
+    # No more songs in queue
+    if ctx.guild.id in current_song_message and current_song_message[ctx.guild.id]:
+        try:
+            embed = discord.Embed(title="⏹ No More Songs to Play", description="The queue is empty. Add more songs to continue!", color=discord.Color.red())
+            await current_song_message[ctx.guild.id].edit(embed=embed, view=None)  # Remove buttons
+        except discord.NotFound:
+            pass
 
 async def handle_playlist(ctx, url):
     """Handles the playlist and queues each song."""
