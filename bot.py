@@ -1,7 +1,7 @@
 import os
 import discord
 from discord.ext import commands
-from dotenv import load_dotenv  # Import dotenv
+from dotenv import load_dotenv
 import youtube_dl
 import asyncio
 from yt_dlp import YoutubeDL
@@ -33,8 +33,10 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 youtube_dl.utils.bug_reports_message = lambda: ''
 
+
 class YTDLError(Exception):
     pass
+
 
 class YTDLSource(discord.PCMVolumeTransformer):
     def __init__(self, source, *, data, volume=0.5):
@@ -76,10 +78,11 @@ class YTDLSource(discord.PCMVolumeTransformer):
         }
         return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
 
+
 # 🎵 Button Controls View 🎵
 class MusicControls(discord.ui.View):
     def __init__(self, ctx):
-        super().__init__()
+        super().__init__(timeout=None)  # Prevents buttons from auto-disabling after 15 minutes
         self.ctx = ctx
 
     @discord.ui.button(label="⏭ Skip", style=discord.ButtonStyle.blurple)
@@ -109,19 +112,20 @@ class MusicControls(discord.ui.View):
         if self.ctx.voice_client:
             self.ctx.voice_client.stop()
 
-        # Delete the last message if it exists
         if guild_id in current_song_message and current_song_message[guild_id]:
             try:
                 await current_song_message[guild_id].delete()
-                current_song_message[guild_id] = None  # Reset reference
+                current_song_message[guild_id] = None
             except discord.NotFound:
                 pass
 
         await interaction.response.defer()
 
+
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user}')
+
 
 @bot.command()
 async def join(ctx):
@@ -131,6 +135,7 @@ async def join(ctx):
     else:
         channel = ctx.message.author.voice.channel
     await channel.connect()
+
 
 @bot.command()
 async def play(ctx, *, search: str):
@@ -157,16 +162,16 @@ async def play(ctx, *, search: str):
                 except YTDLError:
                     await play_next(ctx)
 
+
 async def update_music_message(ctx, player):
-    """Deletes the old message and sends a new one, keeping only one message."""
+    """Updates the bot message to keep only one active message."""
     guild_id = ctx.guild.id
 
-    # Delete the previous message if it exists
     if guild_id in current_song_message and current_song_message[guild_id]:
         try:
             await current_song_message[guild_id].delete()
         except discord.NotFound:
-            pass  # Ignore if already deleted
+            pass
 
     video_id = player.url.split("v=")[-1]
     thumbnail_url = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
@@ -177,7 +182,8 @@ async def update_music_message(ctx, player):
     view = MusicControls(ctx)
 
     msg = await ctx.send(embed=embed, view=view)
-    current_song_message[guild_id] = msg  # Store the new message reference
+    current_song_message[guild_id] = msg
+
 
 async def play_next(ctx):
     """Plays the next song in the queue or updates the message if queue is empty."""
@@ -194,15 +200,16 @@ async def play_next(ctx):
                 await update_music_message(ctx, player)
                 return
             except YTDLError:
-                continue  # Skip to next song silently
+                continue
 
     # No more songs in queue
     if ctx.guild.id in current_song_message and current_song_message[ctx.guild.id]:
         try:
             embed = discord.Embed(title="⏹ No More Songs to Play", description="The queue is empty. Add more songs to continue!", color=discord.Color.red())
-            await current_song_message[ctx.guild.id].edit(embed=embed, view=None)  # Remove buttons
+            await current_song_message[ctx.guild.id].edit(embed=embed, view=None)
         except discord.NotFound:
             pass
+
 
 async def handle_playlist(ctx, url):
     """Handles the playlist and queues each song."""
@@ -216,13 +223,10 @@ async def handle_playlist(ctx, url):
         if ctx.guild.id not in queues:
             queues[ctx.guild.id] = deque()
 
-        if ctx.voice_client.is_playing():
-            for entry in entries:
-                queues[ctx.guild.id].append(entry['url'])
-        else:
-            await play(ctx, search=entries[0]['url'])
-            for entry in entries[1:]:
-                queues[ctx.guild.id].append(entry['url'])
+        await play(ctx, search=entries[0]['url'])
+        for entry in entries[1:]:
+            queues[ctx.guild.id].append(entry['url'])
+
 
 @bot.command()
 async def leave(ctx):
