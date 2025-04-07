@@ -354,7 +354,7 @@ async def play_next(ctx):
             return
         
         # Check if there are songs in the queue
-        if guild_id in queues and queues[guild_id]:
+        if guild_id in queues and queues[guild_id] and len(queues[guild_id]) > 0:
             try:
                 # Get the next URL from the queue
                 next_url = queues[guild_id].popleft()
@@ -394,15 +394,18 @@ async def play_next(ctx):
                 await play_next(ctx)
         
         # No more songs in queue - only show the message if we were actually playing something
+        # and the queue is truly empty
         if guild_id in current_song and current_song[guild_id]:
-            if guild_id in current_song_message and current_song_message[guild_id]:
-                try:
-                    embed = discord.Embed(title="⏹ No More Songs to Play", description="The queue is empty. Add more songs to continue!", color=discord.Color.red())
-                    await current_song_message[guild_id].edit(embed=embed, view=None)
-                except discord.NotFound:
-                    pass
-            # Clear the current song
-            current_song[guild_id] = None
+            # Double-check if the queue is really empty
+            if not (guild_id in queues and queues[guild_id] and len(queues[guild_id]) > 0):
+                if guild_id in current_song_message and current_song_message[guild_id]:
+                    try:
+                        embed = discord.Embed(title="⏹ No More Songs to Play", description="The queue is empty. Add more songs to continue!", color=discord.Color.red())
+                        await current_song_message[guild_id].edit(embed=embed, view=None)
+                    except discord.NotFound:
+                        pass
+                # Clear the current song
+                current_song[guild_id] = None
     finally:
         # Release the lock
         playing_locks[guild_id] = False
@@ -416,15 +419,20 @@ async def preload_next_song(ctx):
     preloaded_songs[guild_id] = None
     
     # Check if there are songs in the queue
-    if guild_id in queues and queues[guild_id]:
+    if guild_id in queues and queues[guild_id] and len(queues[guild_id]) > 0:
         # Get the next URL without removing it from the queue
         next_url = queues[guild_id][0]
         try:
             # Preload the song
             player = await YTDLSource.from_url(next_url, loop=bot.loop, stream=True)
             preloaded_songs[guild_id] = player
+            print(f"Preloaded song: {player.title} for guild {guild_id}")
         except YTDLError:
             # If preloading fails, just continue
+            print(f"Failed to preload song: {next_url} for guild {guild_id}")
+            pass
+        except Exception as e:
+            print(f"Error preloading song: {e}")
             pass
 
 
@@ -439,10 +447,39 @@ async def handle_playlist(ctx, url):
 
         if ctx.guild.id not in queues:
             queues[ctx.guild.id] = deque()
-
-        await play(ctx, search=entries[0]['url'])
-        for entry in entries[1:]:
-            queues[ctx.guild.id].append(entry['url'])
+        
+        # Create a set to track unique URLs to prevent duplicates
+        unique_urls = set()
+        
+        # First, add all unique URLs to the queue
+        for entry in entries:
+            if 'url' in entry and entry['url'] not in unique_urls:
+                unique_urls.add(entry['url'])
+                queues[ctx.guild.id].append(entry['url'])
+        
+        # If the bot is not already playing, start playing the first song
+        if not ctx.voice_client or not ctx.voice_client.is_playing():
+            if queues[ctx.guild.id]:
+                first_url = queues[ctx.guild.id].popleft()
+                try:
+                    player = await YTDLSource.from_url(first_url, loop=bot.loop, stream=True)
+                    
+                    # Add a small delay to ensure buffer is filled
+                    await asyncio.sleep(0.5)
+                    
+                    ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop).result() if e is None else None)
+                    current_song[ctx.guild.id] = player
+                    
+                    await update_music_message(ctx, player)
+                    await ctx.send(f"🎵 Playing playlist. Added {len(queues[ctx.guild.id])} songs to the queue.")
+                except Exception as e:
+                    print(f"Error playing first song from playlist: {e}")
+                    await ctx.send(f"❌ Error playing the first song from the playlist: {str(e)}")
+            else:
+                await ctx.send("❌ No valid songs found in the playlist.")
+        else:
+            # If already playing, just add to queue
+            await ctx.send(f"🎵 Added {len(queues[ctx.guild.id])} songs from the playlist to the queue.")
 
 
 @bot.command()
@@ -564,5 +601,131 @@ async def queue(ctx):
         embed.add_field(name="Up Next", value=queue_list, inline=False)
     
     await ctx.send(embed=embed)
+
+@bot.command()
+async def debug(ctx):
+    """Shows debug information about the current state of the bot."""
+    guild_id = ctx.guild.id
+    
+    # Create an embed for debug information
+    embed = discord.Embed(title="🔍 Debug Information", color=discord.Color.blue())
+    
+    # Voice client status
+    if ctx.voice_client:
+        embed.add_field(name="Voice Client", value=f"Connected: {ctx.voice_client.is_connected()}\nPlaying: {ctx.voice_client.is_playing()}\nPaused: {ctx.voice_client.is_paused()}", inline=False)
+    else:
+        embed.add_field(name="Voice Client", value="Not connected", inline=False)
+    
+    # Queue information
+    queue_length = len(queues.get(guild_id, [])) if guild_id in queues else 0
+    embed.add_field(name="Queue", value=f"Length: {queue_length}", inline=False)
+    
+    # Current song information
+    if guild_id in current_song and current_song[guild_id]:
+        embed.add_field(name="Current Song", value=f"Title: {current_song[guild_id].title}\nURL: {current_song[guild_id].url}", inline=False)
+    else:
+        embed.add_field(name="Current Song", value="None", inline=False)
+    
+    # Preloaded song information
+    if guild_id in preloaded_songs and preloaded_songs[guild_id]:
+        embed.add_field(name="Preloaded Song", value=f"Title: {preloaded_songs[guild_id].title}\nURL: {preloaded_songs[guild_id].url}", inline=False)
+    else:
+        embed.add_field(name="Preloaded Song", value="None", inline=False)
+    
+    # Lock status
+    embed.add_field(name="Lock Status", value=f"Playing Lock: {playing_locks.get(guild_id, False)}", inline=False)
+    
+    # Send the debug information
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def checkduplicates(ctx):
+    """Checks for duplicate songs in the queue."""
+    guild_id = ctx.guild.id
+    
+    if guild_id not in queues or not queues[guild_id]:
+        await ctx.send("📋 The queue is empty.")
+        return
+    
+    # Create a set to track unique URLs
+    unique_urls = set()
+    duplicates = []
+    
+    # Check for duplicates
+    for url in queues[guild_id]:
+        if url in unique_urls:
+            duplicates.append(url)
+        else:
+            unique_urls.add(url)
+    
+    # Create an embed to display the results
+    embed = discord.Embed(title="🔍 Duplicate Check", color=discord.Color.blue())
+    
+    if duplicates:
+        # Extract video IDs for the duplicates
+        duplicate_list = ""
+        for i, url in enumerate(duplicates, 1):
+            try:
+                # Use a simple regex to extract video ID
+                video_id = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url)
+                if video_id:
+                    video_id = video_id.group(1)
+                    duplicate_list += f"{i}. [Video](https://www.youtube.com/watch?v={video_id})\n"
+                else:
+                    duplicate_list += f"{i}. {url}\n"
+            except:
+                duplicate_list += f"{i}. {url}\n"
+        
+        embed.add_field(name="Duplicates Found", value=f"Found {len(duplicates)} duplicate songs in the queue.", inline=False)
+        embed.add_field(name="Duplicate Songs", value=duplicate_list, inline=False)
+        
+        # Add a button to remove duplicates
+        view = RemoveDuplicatesView(ctx)
+        await ctx.send(embed=embed, view=view)
+    else:
+        embed.add_field(name="Result", value="✅ No duplicate songs found in the queue.", inline=False)
+        await ctx.send(embed=embed)
+
+
+class RemoveDuplicatesView(discord.ui.View):
+    def __init__(self, ctx):
+        super().__init__(timeout=60)  # 60 second timeout
+        self.ctx = ctx
+
+    @discord.ui.button(label="Remove Duplicates", style=discord.ButtonStyle.red)
+    async def remove_duplicates(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Defer the response immediately to prevent timeout
+        await interaction.response.defer(ephemeral=True)
+        
+        guild_id = self.ctx.guild.id
+        
+        if guild_id not in queues or not queues[guild_id]:
+            await interaction.followup.send("❌ The queue is empty.", ephemeral=True)
+            return
+        
+        # Create a new queue with only unique URLs
+        new_queue = deque()
+        unique_urls = set()
+        
+        # Add only unique URLs to the new queue
+        for url in queues[guild_id]:
+            if url not in unique_urls:
+                unique_urls.add(url)
+                new_queue.append(url)
+        
+        # Count how many duplicates were removed
+        removed_count = len(queues[guild_id]) - len(new_queue)
+        
+        # Replace the old queue with the new one
+        queues[guild_id] = new_queue
+        
+        # Disable the button
+        self.remove_duplicates.disabled = True
+        
+        # Update the message
+        embed = discord.Embed(title="✅ Duplicates Removed", description=f"Removed {removed_count} duplicate songs from the queue.", color=discord.Color.green())
+        await interaction.message.edit(embed=embed, view=self)
+        
+        await interaction.followup.send(f"✅ Removed {removed_count} duplicate songs from the queue.", ephemeral=True)
 
 bot.run(BOT_TOKEN)
