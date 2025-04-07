@@ -20,6 +20,8 @@ if not BOT_TOKEN:
 queues = {}
 current_song = {}
 current_song_message = {}  # Stores the last sent bot message per guild
+song_cache = {}  # Cache for song information to avoid re-fetching
+preloaded_songs = {}  # Store preloaded songs for each guild
 
 # Configure intents
 intents = discord.Intents.default()
@@ -44,23 +46,41 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.data = data
         self.title = data.get('title')
         self.url = data.get('webpage_url')
+        self._start_time = None
 
     @classmethod
     async def from_url(cls, url, *, loop=None, stream=False):
         loop = loop or asyncio.get_event_loop()
+        
+        # Check if we have cached data for this URL
+        if url in song_cache:
+            data = song_cache[url]
+            filename = data['url'] if stream else data.get('filename')
+            ffmpeg_options = {
+                'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin -nostdin',
+                'options': '-vn -bufsize 128k -ar 48000 -ac 2 -f s16le -loglevel warning -af "aresample=48000:first_pts=0"'
+            }
+            return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
+            
         ydl_opts = {
             'format': 'bestaudio/best',
             'extractaudio': True,
             'audioformat': 'mp3',
             'logtostderr': False,
             'no_warnings': True,
-            'quiet': False,
+            'quiet': True,
             'ignoreerrors': True,
             'retries': 3,
             'nocheckcertificate': True,
             'skip_download': True,
             'default_search': 'auto',
-            'cookies': 'cookies.txt'
+            'cookies': 'cookies.txt',
+            'no_playlist_metafiles': True,
+            'extract_flat': 'in_playlist',
+            'force_generic_extractor': False,
+            'no_color': True,
+            'geo_bypass': True,
+            'socket_timeout': 10
         }
         with YoutubeDL(ydl_opts) as ydl:
             data = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=not stream))
@@ -72,11 +92,22 @@ class YTDLSource(discord.PCMVolumeTransformer):
             data = data['entries'][0]
 
         filename = data['url'] if stream else ydl.prepare_filename(data)
+        
+        # Cache the data for future use
+        song_cache[url] = data
+        
         ffmpeg_options = {
-            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-            'options': '-vn'
+            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin -nostdin',
+            'options': '-vn -bufsize 128k -ar 48000 -ac 2 -f s16le -loglevel warning -af "aresample=48000:first_pts=0"'
         }
-        return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
+        
+        # Create the audio source with a small delay to ensure proper initialization
+        audio_source = discord.FFmpegPCMAudio(filename, **ffmpeg_options)
+        
+        # Add a small delay to ensure the source is properly initialized
+        await asyncio.sleep(0.2)
+        
+        return cls(audio_source, data=data)
 
 
 # 🎵 Button Controls View 🎵
@@ -154,13 +185,20 @@ async def play(ctx, *, search: str):
             else:
                 try:
                     player = await YTDLSource.from_url(search, loop=bot.loop, stream=True)
+                    
+                    # Add a small delay to ensure buffer is filled
+                    await asyncio.sleep(0.5)
+                    
                     ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop).result() if e is None else None)
                     current_song[ctx.guild.id] = player
 
                     await update_music_message(ctx, player)
 
                 except YTDLError:
-                    await play_next(ctx)
+                    await ctx.send(f"❌ Error: Could not play '{search}'. Please try a different song or URL.")
+                except Exception as e:
+                    await ctx.send(f"❌ An unexpected error occurred: {str(e)}")
+                    print(f"Error in play command: {e}")
 
 
 async def update_music_message(ctx, player):
@@ -187,27 +225,84 @@ async def update_music_message(ctx, player):
 
 async def play_next(ctx):
     """Plays the next song in the queue or updates the message if queue is empty."""
-    if ctx.guild.id in queues and queues[ctx.guild.id]:
-        while queues[ctx.guild.id]:
-            next_url = queues[ctx.guild.id].popleft()
+    guild_id = ctx.guild.id
+    
+    # Check if we have a preloaded song
+    if guild_id in preloaded_songs and preloaded_songs[guild_id]:
+        player = preloaded_songs[guild_id]
+        preloaded_songs[guild_id] = None
+        
+        if not ctx.voice_client:
+            await ctx.invoke(join)
+        try:
+            # Add a small delay to ensure buffer is filled
+            await asyncio.sleep(0.5)
+            
+            ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop).result() if e is None else None)
+            current_song[guild_id] = player
+            
+            await update_music_message(ctx, player)
+        except Exception as e:
+            print(f"Error playing preloaded song: {e}")
+            # If there's an error, try the next song
+            await play_next(ctx)
+        
+        # Start preloading the next song
+        asyncio.create_task(preload_next_song(ctx))
+        return
+        
+    if guild_id in queues and queues[guild_id]:
+        while queues[guild_id]:
+            next_url = queues[guild_id].popleft()
             try:
                 player = await YTDLSource.from_url(next_url, loop=bot.loop, stream=True)
                 if not ctx.voice_client:
                     await ctx.invoke(join)
+                
+                # Add a small delay to ensure buffer is filled
+                await asyncio.sleep(0.5)
+                
                 ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop).result() if e is None else None)
-                current_song[ctx.guild.id] = player
+                current_song[guild_id] = player
 
                 await update_music_message(ctx, player)
+                
+                # Start preloading the next song
+                asyncio.create_task(preload_next_song(ctx))
                 return
             except YTDLError:
+                print(f"Error playing song: {next_url}")
+                continue
+            except Exception as e:
+                print(f"Unexpected error playing song: {e}")
                 continue
 
     # No more songs in queue
-    if ctx.guild.id in current_song_message and current_song_message[ctx.guild.id]:
+    if guild_id in current_song_message and current_song_message[guild_id]:
         try:
             embed = discord.Embed(title="⏹ No More Songs to Play", description="The queue is empty. Add more songs to continue!", color=discord.Color.red())
-            await current_song_message[ctx.guild.id].edit(embed=embed, view=None)
+            await current_song_message[guild_id].edit(embed=embed, view=None)
         except discord.NotFound:
+            pass
+
+
+async def preload_next_song(ctx):
+    """Preloads the next song in the queue to reduce latency when switching songs."""
+    guild_id = ctx.guild.id
+    
+    # Clear any existing preloaded song
+    preloaded_songs[guild_id] = None
+    
+    # Check if there are songs in the queue
+    if guild_id in queues and queues[guild_id]:
+        # Get the next URL without removing it from the queue
+        next_url = queues[guild_id][0]
+        try:
+            # Preload the song
+            player = await YTDLSource.from_url(next_url, loop=bot.loop, stream=True)
+            preloaded_songs[guild_id] = player
+        except YTDLError:
+            # If preloading fails, just continue
             pass
 
 
@@ -231,5 +326,13 @@ async def handle_playlist(ctx, url):
 @bot.command()
 async def leave(ctx):
     await ctx.voice_client.disconnect()
+
+@bot.command()
+async def clearcache(ctx):
+    """Clears the song cache to free up memory."""
+    global song_cache
+    cache_size = len(song_cache)
+    song_cache = {}
+    await ctx.send(f"✅ Song cache cleared. Freed up memory from {cache_size} cached songs.")
 
 bot.run(BOT_TOKEN)
