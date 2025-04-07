@@ -6,6 +6,7 @@ import youtube_dl
 import asyncio
 from yt_dlp import YoutubeDL
 from collections import deque
+import re
 
 # Load environment variables from .env file
 load_dotenv()
@@ -22,6 +23,7 @@ current_song = {}
 current_song_message = {}  # Stores the last sent bot message per guild
 song_cache = {}  # Cache for song information to avoid re-fetching
 preloaded_songs = {}  # Store preloaded songs for each guild
+playing_locks = {}  # Locks to prevent multiple songs from playing simultaneously
 
 # Configure intents
 intents = discord.Intents.default()
@@ -118,25 +120,110 @@ class MusicControls(discord.ui.View):
 
     @discord.ui.button(label="⏭ Skip", style=discord.ButtonStyle.blurple)
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.ctx.voice_client and self.ctx.voice_client.is_playing():
+        # Defer the response immediately to prevent timeout
+        await interaction.response.defer(ephemeral=True)
+        
+        if not self.ctx.voice_client:
+            await interaction.followup.send("❌ I'm not connected to a voice channel.", ephemeral=True)
+            return
+            
+        if not self.ctx.voice_client.is_playing():
+            await interaction.followup.send("❌ Nothing is playing right now.", ephemeral=True)
+            return
+        
+        # Get the guild ID
+        guild_id = self.ctx.guild.id
+        
+        # Check if we're already processing a skip (lock mechanism)
+        if guild_id in playing_locks and playing_locks[guild_id]:
+            await interaction.followup.send("⏳ Please wait a moment before skipping again.", ephemeral=True)
+            return
+        
+        # Set the lock
+        playing_locks[guild_id] = True
+        
+        try:
+            # Stop the current song
             self.ctx.voice_client.stop()
-        await interaction.response.defer()
+            
+            # Check if there are songs in the queue
+            if guild_id in queues and queues[guild_id] and len(queues[guild_id]) > 0:
+                # Get the next URL from the queue
+                next_url = queues[guild_id].popleft()
+                
+                try:
+                    # Create the player for the next song
+                    player = await YTDLSource.from_url(next_url, loop=bot.loop, stream=True)
+                    
+                    # Add a small delay to ensure buffer is filled
+                    await asyncio.sleep(0.5)
+                    
+                    # Make sure we're not already playing something
+                    if self.ctx.voice_client.is_playing():
+                        self.ctx.voice_client.stop()
+                        await asyncio.sleep(0.2)  # Small delay to ensure the previous song is fully stopped
+                    
+                    # Play the next song
+                    self.ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(self.ctx), bot.loop).result() if e is None else None)
+                    current_song[guild_id] = player
+                    
+                    # Update the now playing message
+                    await update_music_message(self.ctx, player)
+                    
+                    await interaction.followup.send(f"⏭ Skipped to: **{player.title}**", ephemeral=True)
+                except Exception as e:
+                    print(f"Error playing next song after skip: {e}")
+                    await interaction.followup.send("❌ Error playing the next song. Trying to continue...", ephemeral=True)
+                    # Try to play the next song in the queue
+                    asyncio.create_task(play_next(self.ctx))
+            else:
+                # No more songs in queue
+                if guild_id in current_song_message and current_song_message[guild_id]:
+                    try:
+                        embed = discord.Embed(title="⏹ No More Songs to Play", description="The queue is empty. Add more songs to continue!", color=discord.Color.red())
+                        await current_song_message[guild_id].edit(embed=embed, view=None)
+                    except discord.NotFound:
+                        pass
+                
+                # Clear the current song
+                current_song[guild_id] = None
+                await interaction.followup.send("⏭ Skipped. No more songs in the queue.", ephemeral=True)
+        finally:
+            # Release the lock
+            playing_locks[guild_id] = False
 
     @discord.ui.button(label="⏸ Pause", style=discord.ButtonStyle.gray)
     async def pause(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Defer the response immediately to prevent timeout
+        await interaction.response.defer(ephemeral=True)
+        
         if self.ctx.voice_client and self.ctx.voice_client.is_playing():
             self.ctx.voice_client.pause()
-            await interaction.response.send_message("Song paused.", ephemeral=True)
+            # Use followup instead of response since we already deferred
+            await interaction.followup.send("Song paused.", ephemeral=True)
+        else:
+            # Use followup instead of response since we already deferred
+            await interaction.followup.send("❌ Nothing is playing right now.", ephemeral=True)
 
     @discord.ui.button(label="▶ Resume", style=discord.ButtonStyle.green)
     async def resume(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Defer the response immediately to prevent timeout
+        await interaction.response.defer(ephemeral=True)
+        
         if self.ctx.voice_client and self.ctx.voice_client.is_paused():
             self.ctx.voice_client.resume()
-            await interaction.response.send_message("Song resumed.", ephemeral=True)
+            # Use followup instead of response since we already deferred
+            await interaction.followup.send("Song resumed.", ephemeral=True)
+        else:
+            # Use followup instead of response since we already deferred
+            await interaction.followup.send("❌ No song is paused right now.", ephemeral=True)
 
     @discord.ui.button(label="⏹ Stop", style=discord.ButtonStyle.red)
     async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Stops playback, clears the queue, and deletes the message."""
+        # Defer the response immediately to prevent timeout
+        await interaction.response.defer(ephemeral=True)
+        
         guild_id = self.ctx.guild.id
         if guild_id in queues:
             queues[guild_id].clear()
@@ -150,7 +237,8 @@ class MusicControls(discord.ui.View):
             except discord.NotFound:
                 pass
 
-        await interaction.response.defer()
+        # Use followup instead of response since we already deferred
+        await interaction.followup.send("⏹ Playback stopped and queue cleared.", ephemeral=True)
 
 
 @bot.event
@@ -227,44 +315,70 @@ async def play_next(ctx):
     """Plays the next song in the queue or updates the message if queue is empty."""
     guild_id = ctx.guild.id
     
-    # Check if we have a preloaded song
-    if guild_id in preloaded_songs and preloaded_songs[guild_id]:
-        player = preloaded_songs[guild_id]
-        preloaded_songs[guild_id] = None
-        
-        if not ctx.voice_client:
-            await ctx.invoke(join)
-        try:
-            # Add a small delay to ensure buffer is filled
-            await asyncio.sleep(0.5)
-            
-            ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop).result() if e is None else None)
-            current_song[guild_id] = player
-            
-            await update_music_message(ctx, player)
-        except Exception as e:
-            print(f"Error playing preloaded song: {e}")
-            # If there's an error, try the next song
-            await play_next(ctx)
-        
-        # Start preloading the next song
-        asyncio.create_task(preload_next_song(ctx))
+    # Check if we're already playing a song (lock mechanism)
+    if guild_id in playing_locks and playing_locks[guild_id]:
+        print(f"Already playing a song in guild {guild_id}, skipping play_next call")
         return
-        
-    if guild_id in queues and queues[guild_id]:
-        while queues[guild_id]:
-            next_url = queues[guild_id].popleft()
+    
+    # Set the lock
+    playing_locks[guild_id] = True
+    
+    try:
+        # Check if we have a preloaded song
+        if guild_id in preloaded_songs and preloaded_songs[guild_id]:
+            player = preloaded_songs[guild_id]
+            preloaded_songs[guild_id] = None
+            
+            if not ctx.voice_client:
+                await ctx.invoke(join)
             try:
+                # Add a small delay to ensure buffer is filled
+                await asyncio.sleep(0.5)
+                
+                # Make sure we're not already playing something
+                if ctx.voice_client.is_playing():
+                    ctx.voice_client.stop()
+                    await asyncio.sleep(0.2)  # Small delay to ensure the previous song is fully stopped
+                
+                ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop).result() if e is None else None)
+                current_song[guild_id] = player
+                
+                await update_music_message(ctx, player)
+            except Exception as e:
+                print(f"Error playing preloaded song: {e}")
+                # If there's an error, try the next song
+                await play_next(ctx)
+            
+            # Start preloading the next song
+            asyncio.create_task(preload_next_song(ctx))
+            return
+        
+        # Check if there are songs in the queue
+        if guild_id in queues and queues[guild_id]:
+            try:
+                # Get the next URL from the queue
+                next_url = queues[guild_id].popleft()
+                
+                # Create the player for the next song
                 player = await YTDLSource.from_url(next_url, loop=bot.loop, stream=True)
+                
+                # Make sure we're connected to a voice channel
                 if not ctx.voice_client:
                     await ctx.invoke(join)
                 
                 # Add a small delay to ensure buffer is filled
                 await asyncio.sleep(0.5)
                 
+                # Make sure we're not already playing something
+                if ctx.voice_client.is_playing():
+                    ctx.voice_client.stop()
+                    await asyncio.sleep(0.2)  # Small delay to ensure the previous song is fully stopped
+                
+                # Play the next song
                 ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop).result() if e is None else None)
                 current_song[guild_id] = player
-
+                
+                # Update the now playing message
                 await update_music_message(ctx, player)
                 
                 # Start preloading the next song
@@ -272,18 +386,26 @@ async def play_next(ctx):
                 return
             except YTDLError:
                 print(f"Error playing song: {next_url}")
-                continue
+                # If there's an error with this song, try the next one
+                await play_next(ctx)
             except Exception as e:
                 print(f"Unexpected error playing song: {e}")
-                continue
-
-    # No more songs in queue
-    if guild_id in current_song_message and current_song_message[guild_id]:
-        try:
-            embed = discord.Embed(title="⏹ No More Songs to Play", description="The queue is empty. Add more songs to continue!", color=discord.Color.red())
-            await current_song_message[guild_id].edit(embed=embed, view=None)
-        except discord.NotFound:
-            pass
+                # If there's an error, try the next song
+                await play_next(ctx)
+        
+        # No more songs in queue - only show the message if we were actually playing something
+        if guild_id in current_song and current_song[guild_id]:
+            if guild_id in current_song_message and current_song_message[guild_id]:
+                try:
+                    embed = discord.Embed(title="⏹ No More Songs to Play", description="The queue is empty. Add more songs to continue!", color=discord.Color.red())
+                    await current_song_message[guild_id].edit(embed=embed, view=None)
+                except discord.NotFound:
+                    pass
+            # Clear the current song
+            current_song[guild_id] = None
+    finally:
+        # Release the lock
+        playing_locks[guild_id] = False
 
 
 async def preload_next_song(ctx):
@@ -334,5 +456,113 @@ async def clearcache(ctx):
     cache_size = len(song_cache)
     song_cache = {}
     await ctx.send(f"✅ Song cache cleared. Freed up memory from {cache_size} cached songs.")
+
+@bot.command()
+async def skip(ctx):
+    """Skips the current song and plays the next one in the queue."""
+    if not ctx.voice_client:
+        await ctx.send("❌ I'm not connected to a voice channel.")
+        return
+    
+    if not ctx.voice_client.is_playing():
+        await ctx.send("❌ Nothing is playing right now.")
+        return
+    
+    # Get the guild ID
+    guild_id = ctx.guild.id
+    
+    # Check if we're already processing a skip (lock mechanism)
+    if guild_id in playing_locks and playing_locks[guild_id]:
+        await ctx.send("⏳ Please wait a moment before skipping again.")
+        return
+    
+    # Set the lock
+    playing_locks[guild_id] = True
+    
+    try:
+        # Stop the current song
+        ctx.voice_client.stop()
+        
+        # Check if there are songs in the queue
+        if guild_id in queues and queues[guild_id] and len(queues[guild_id]) > 0:
+            # Get the next URL from the queue
+            next_url = queues[guild_id].popleft()
+            
+            try:
+                # Create the player for the next song
+                player = await YTDLSource.from_url(next_url, loop=bot.loop, stream=True)
+                
+                # Add a small delay to ensure buffer is filled
+                await asyncio.sleep(0.5)
+                
+                # Make sure we're not already playing something
+                if ctx.voice_client.is_playing():
+                    ctx.voice_client.stop()
+                    await asyncio.sleep(0.2)  # Small delay to ensure the previous song is fully stopped
+                
+                # Play the next song
+                ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop).result() if e is None else None)
+                current_song[guild_id] = player
+                
+                # Update the now playing message
+                await update_music_message(ctx, player)
+                
+                await ctx.send(f"⏭ Skipped to: **{player.title}**")
+            except Exception as e:
+                print(f"Error playing next song after skip: {e}")
+                await ctx.send("❌ Error playing the next song. Trying to continue...")
+                # Try to play the next song in the queue
+                asyncio.create_task(play_next(ctx))
+        else:
+            # No more songs in queue
+            if guild_id in current_song_message and current_song_message[guild_id]:
+                try:
+                    embed = discord.Embed(title="⏹ No More Songs to Play", description="The queue is empty. Add more songs to continue!", color=discord.Color.red())
+                    await current_song_message[guild_id].edit(embed=embed, view=None)
+                except discord.NotFound:
+                    pass
+            
+            # Clear the current song
+            current_song[guild_id] = None
+            await ctx.send("⏭ Skipped. No more songs in the queue.")
+    finally:
+        # Release the lock
+        playing_locks[guild_id] = False
+
+@bot.command()
+async def queue(ctx):
+    """Shows the current queue of songs."""
+    guild_id = ctx.guild.id
+    
+    if guild_id not in queues or not queues[guild_id]:
+        await ctx.send("📋 The queue is empty.")
+        return
+    
+    # Create an embed to display the queue
+    embed = discord.Embed(title="📋 Current Queue", color=discord.Color.blue())
+    
+    # Add the currently playing song if there is one
+    if guild_id in current_song and current_song[guild_id]:
+        embed.add_field(name="Now Playing", value=f"🎵 **{current_song[guild_id].title}**", inline=False)
+    
+    # Add the queued songs
+    queue_list = ""
+    for i, url in enumerate(queues[guild_id], 1):
+        # Try to get the title from the URL
+        try:
+            # Use a simple regex to extract video ID
+            video_id = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url)
+            if video_id:
+                video_id = video_id.group(1)
+                queue_list += f"{i}. [Video](https://www.youtube.com/watch?v={video_id})\n"
+            else:
+                queue_list += f"{i}. {url}\n"
+        except:
+            queue_list += f"{i}. {url}\n"
+    
+    if queue_list:
+        embed.add_field(name="Up Next", value=queue_list, inline=False)
+    
+    await ctx.send(embed=embed)
 
 bot.run(BOT_TOKEN)
