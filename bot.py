@@ -62,11 +62,16 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.data = data
         self.title = data.get('title')
         self.url = data.get('webpage_url')
+        self.postprocessors = [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }]
         self._start_time = None
         self._process = None  # Store the FFmpeg process
 
     @classmethod
-    async def from_url(cls, url, *, loop=None, stream=False):
+    async def from_url(cls, url, *, loop=None, stream=False, retry_count=0):
         loop = loop or asyncio.get_event_loop()
         
         logger.info(f"Creating YTDLSource from URL: {url}")
@@ -87,15 +92,35 @@ class YTDLSource(discord.PCMVolumeTransformer):
             }
             return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
             
+        # Define different format options to try in case of format errors
+        format_options = [
+            'bestaudio[ext=m4a]/bestaudio/best',  # Try first with m4a format
+            'bestaudio/best',                     # Then try any audio format
+            'worstaudio/worst'                    # Last resort, any audio quality
+        ]
+        
+        # Use the appropriate format option based on retry count
+        if retry_count < len(format_options):
+            selected_format = format_options[retry_count]
+        else:
+            # If we've tried all formats, raise an error
+            logger.error(f"Tried all format options for URL: {url}")
+            raise YTDLError(f"Could not extract information from URL after multiple format attempts: {url}")
+            
+        logger.info(f"Using format option for URL {url}: {selected_format} (retry: {retry_count})")
+        
         ydl_opts = {
-            'format': 'bestaudio/best',
-            'extractaudio': True,
-            'audioformat': 'mp3',
+            'format': selected_format,
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
             'logtostderr': False,
             'no_warnings': True,
             'quiet': True,
             'ignoreerrors': True,
-            'retries': 3,
+            'retries': 10,
             'nocheckcertificate': True,
             'skip_download': True,
             'default_search': 'auto',
@@ -105,7 +130,12 @@ class YTDLSource(discord.PCMVolumeTransformer):
             'force_generic_extractor': False,
             'no_color': True,
             'geo_bypass': True,
-            'socket_timeout': 10
+            'geo_bypass_country': 'US',
+            'socket_timeout': 30,
+            'extractor_args': {'youtube': {'skip': ['dash']}},
+            'cookiefile': 'cookies.txt',
+            'noplaylist': True,
+            'youtube_include_dash_manifest': False
         }
         
         try:
@@ -128,6 +158,14 @@ class YTDLSource(discord.PCMVolumeTransformer):
         except Exception as e:
             logger.error(f"Error extracting info for URL {url}: {str(e)}")
             logger.error(traceback.format_exc())
+            
+            # Check if this is a format error and we can retry with a different format
+            error_msg = str(e).lower()
+            if ("format" in error_msg or "requested format is not available" in error_msg) and retry_count < 2:
+                logger.info(f"Format error detected for URL {url}, retrying with different format (retry: {retry_count+1})")
+                # Try again with a different format
+                return await cls.from_url(url, loop=loop, stream=stream, retry_count=retry_count+1)
+            
             raise YTDLError(f"Error extracting info: {str(e)}")
 
         filename = data['url'] if stream else ydl.prepare_filename(data)
@@ -359,6 +397,8 @@ class MusicControls(discord.ui.View):
 @bot.event
 async def on_ready():
     logger.info(f'Logged in as {bot.user}')
+    ensure_cookies_file()
+    logger.info("Checked cookies file")
 
 
 @bot.command()
@@ -459,9 +499,20 @@ async def play(ctx, *, search: str):
 
                     await update_music_message(ctx, player)
 
-                except YTDLError:
-                    logger.error(f"YTDL error for search: {search}")
-                    await ctx.send(f"❌ Error: Could not play '{search}'. Please try a different song or URL.")
+                except YTDLError as e:
+                    logger.error(f"YTDL error for search: {search} - {str(e)}")
+                    # Extract the error message for a more user-friendly response
+                    error_msg = str(e)
+                    if "format" in error_msg.lower():
+                        await ctx.send(f"❌ Error: The requested video format is unavailable. YouTube may have changed something. Trying to play the next song in the playlist...")
+                        # Try to play the next song
+                        asyncio.create_task(play_next(ctx))
+                    elif "copyright" in error_msg.lower() or "removed" in error_msg.lower():
+                        await ctx.send(f"❌ Error: The first video in the playlist may have been removed due to copyright issues. Trying to play the next song...")
+                        # Try to play the next song
+                        asyncio.create_task(play_next(ctx))
+                    else:
+                        await ctx.send(f"❌ Error: Could not play '{search}'. Please try a different song or URL.")
                 except Exception as e:
                     logger.error(f"Error in play command: {e}")
                     logger.error(traceback.format_exc())
@@ -620,6 +671,30 @@ async def play_next(ctx):
             except YTDLError as e:
                 logger.error(f"YTDL error for song: {next_url}")
                 logger.error(f"YTDL error details: {str(e)}")
+                
+                # Remove this URL from the queue if it's still there
+                if guild_id in queues and next_url in queues[guild_id]:
+                    logger.info(f"Removing problematic URL {next_url} from queue")
+                    try:
+                        queues[guild_id].remove(next_url)
+                    except ValueError:
+                        pass
+                
+                # Check if there are more songs in the queue
+                if guild_id in queues and queues[guild_id]:
+                    logger.info(f"There are {len(queues[guild_id])} more songs in the queue, trying next one")
+                    # Extract the error message for a more user-friendly response
+                    error_msg = str(e)
+                    if "format is not available" in error_msg.lower() or "format" in error_msg.lower():
+                        await ctx.send(f"❌ Error: YouTube format unavailable for '{next_url}'. This can happen due to YouTube limitations. Trying the next song...")
+                        # Try to play the next song
+                        asyncio.create_task(play_next(ctx))
+                    elif "copyright" in error_msg.lower() or "removed" in error_msg.lower():
+                        await ctx.send(f"❌ Error: The video may have been removed due to copyright issues. Trying the next song...")
+                        # Try to play the next song
+                        asyncio.create_task(play_next(ctx))
+                    else:
+                        await ctx.send(f"❌ Error: Could not play a song. Trying the next one...")
                 # If there's an error with this song, try the next one
                 asyncio.create_task(play_next(ctx))
             except Exception as e:
@@ -697,12 +772,42 @@ async def preload_next_song(ctx):
             logger.error(traceback.format_exc())
             pass
 
+        except YTDLError as e:
+            # If preloading fails, remove problematic URL from queue and try next one
+            logger.error(f"Failed to preload song: {next_url} for guild {guild_id}: {str(e)}")
+            
+            # Remove this URL from the queue if it exists
+            if guild_id in queues and queues[guild_id] and queues[guild_id][0] == next_url:
+                logger.info(f"Removing problematic URL {next_url} from queue during preload")
+                queues[guild_id].popleft()
+                
+                # Try preloading the next song if there is one
+                if queues[guild_id] and len(queues[guild_id]) > 0:
+                    asyncio.create_task(preload_next_song(ctx))
+            pass
+
 
 async def handle_playlist(ctx, url):
     """Handles the playlist and queues each song."""
     logger.info(f"Handling playlist: {url} for guild {ctx.guild.id}")
     
-    ydl_opts = {'format': 'bestaudio/best', 'extract_flat': 'in_playlist', 'quiet': True}
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }],
+        'extract_flat': 'in_playlist',
+        'quiet': True,
+        'ignoreerrors': True,
+        'retries': 5,
+        'nocheckcertificate': True,
+        'geo_bypass': True,
+        'geo_bypass_country': 'US',
+        'extractor_args': {'youtube': {'skip': ['dash', 'hls']}},
+        'cookiefile': 'cookies.txt'
+    }
     with YoutubeDL(ydl_opts) as ydl:
         info_dict = ydl.extract_info(url, download=False)
         entries = info_dict['entries']
@@ -1169,5 +1274,20 @@ async def on_voice_state_update(member, before, after):
         if guild_id in playing_locks:
             logger.info(f"Resetting playing lock in guild {guild_id}")
             playing_locks[guild_id] = False
+
+# Create a function to ensure the cookies file exists
+def ensure_cookies_file():
+    """Ensure the cookies file exists to prevent errors."""
+    cookies_file = 'cookies.txt'
+    try:
+        if not os.path.exists(cookies_file):
+            logger.info(f"Creating empty cookies file: {cookies_file}")
+            with open(cookies_file, 'w') as f:
+                # Write an empty cookies file
+                f.write("# Netscape HTTP Cookie File\n")
+        return True
+    except Exception as e:
+        logger.error(f"Error creating cookies file: {e}")
+        return False
 
 bot.run(BOT_TOKEN)
