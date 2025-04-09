@@ -57,7 +57,7 @@ class YTDLError(Exception):
 
 
 class YTDLSource(discord.PCMVolumeTransformer):
-    def __init__(self, source, *, data, volume=0.5):
+    def __init__(self, source, *, data, volume=0.7):
         super().__init__(source, volume)
         self.data = data
         self.title = data.get('title')
@@ -70,25 +70,54 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self._start_time = None
         self._process = None  # Store the FFmpeg process
 
+    @staticmethod
+    def is_url(text):
+        """Check if the provided text is a URL.
+        
+        This includes common YouTube and other music streaming service links.
+        """
+        # Standard URL patterns
+        if text.startswith(('http://', 'https://')):
+            return True
+            
+        # YouTube shortened URLs
+        if text.startswith(('youtu.be/', 'youtube.com/', 'www.youtube.com/')):
+            return True
+            
+        # Other common music services
+        if any(domain in text for domain in ['spotify.com', 'soundcloud.com', 'bandcamp.com']):
+            return True
+            
+        return False
+
     @classmethod
-    async def from_url(cls, url, *, loop=None, stream=False, retry_count=0):
+    async def from_url(cls, url_or_search, *, loop=None, stream=False, retry_count=0):
         loop = loop or asyncio.get_event_loop()
+        
+        # Check if this is a URL or a search query
+        if cls.is_url(url_or_search):
+            logger.info(f"Processing URL: {url_or_search}")
+            url = url_or_search
+        else:
+            logger.info(f"Processing search query: {url_or_search}")
+            # Treat as search query
+            url = f"ytsearch:{url_or_search}"
         
         logger.info(f"Creating YTDLSource from URL: {url}")
         
-        # Validate URL format
-        if not url.startswith(('http://', 'https://')):
+        # Only validate URL format for actual URLs, not for search queries
+        if not url.startswith('ytsearch:') and not url.startswith(('http://', 'https://')):
             logger.error(f"Invalid URL format: {url}")
             raise YTDLError("Invalid URL format. Please provide a valid HTTP/HTTPS URL.")
         
         # Check if we have cached data for this URL
         if url in song_cache:
-            logger.info(f"Using cached data for URL: {url}")
+            logger.info(f"Using cached data for: {url}")
             data = song_cache[url]
             filename = data['url'] if stream else data.get('filename')
             ffmpeg_options = {
-                'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin -nostdin',
-                'options': '-vn -bufsize 128k -ar 48000 -ac 2 -f s16le -loglevel warning -af "aresample=48000:first_pts=0"'
+                'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+                'options': '-vn'
             }
             return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
             
@@ -109,34 +138,40 @@ class YTDLSource(discord.PCMVolumeTransformer):
             
         logger.info(f"Using format option for URL {url}: {selected_format} (retry: {retry_count})")
         
-        ydl_opts = {
-            'format': selected_format,
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-            'logtostderr': False,
-            'no_warnings': True,
-            'quiet': True,
-            'ignoreerrors': True,
-            'retries': 10,
-            'nocheckcertificate': True,
-            'skip_download': True,
-            'default_search': 'auto',
-            'cookies': 'cookies.txt',
-            'no_playlist_metafiles': True,
-            'extract_flat': 'in_playlist',
-            'force_generic_extractor': False,
-            'no_color': True,
-            'geo_bypass': True,
-            'geo_bypass_country': 'US',
-            'socket_timeout': 30,
-            'extractor_args': {'youtube': {'skip': ['dash']}},
-            'cookiefile': 'cookies.txt',
-            'noplaylist': True,
-            'youtube_include_dash_manifest': False
-        }
+        # Special handling for search queries vs direct URLs
+        if url.startswith('ytsearch:'):
+            logger.info(f"Using simplified options for search query")
+            ydl_opts = {
+                'format': selected_format,
+                'quiet': True,
+                'no_warnings': True,
+                'default_search': 'auto',
+                'noplaylist': True,
+                'nocheckcertificate': True,
+                'ignoreerrors': False,  # We want to catch errors for search queries
+                'logtostderr': False,
+                'geo_bypass': True,
+                'source_address': '0.0.0.0',  # Bind to all interfaces
+                'retries': 5
+            }
+        else:
+            ydl_opts = {
+                'format': selected_format,
+                'postprocessors': [],        # No post-processing to avoid any delays
+                'extract_flat': 'in_playlist',
+                'quiet': True,
+                'ignoreerrors': True,
+                'retries': 10,
+                'nocheckcertificate': True,
+                'skip_download': True,       # Important: just streaming, not downloading
+                'default_search': 'auto',
+                'cookies': 'cookies.txt',
+                'geo_bypass': True,          # Bypass geo-restrictions
+                'geo_bypass_country': 'US',
+                'socket_timeout': 30,
+                'cookiefile': 'cookies.txt',
+                'noplaylist': True
+            }
         
         try:
             with YoutubeDL(ydl_opts) as ydl:
@@ -147,14 +182,25 @@ class YTDLSource(discord.PCMVolumeTransformer):
                 logger.error(f"Failed to extract info for URL: {url}")
                 raise YTDLError(f"Could not extract information from URL: {url}")
 
+            # Handle both search results and playlists that have 'entries'
             if 'entries' in data and data['entries']:
-                logger.info(f"URL is a playlist, using first entry: {url}")
-                data = data['entries'][0]
+                if url.startswith('ytsearch:'):
+                    logger.info(f"Found {len(data['entries'])} search results for: {url}")
+                    # Take the first search result
+                    if len(data['entries']) > 0:
+                        data = data['entries'][0]
+                        logger.info(f"Selected first search result: {data.get('title', 'Unknown')}")
+                    else:
+                        logger.error(f"No search results found for: {url}")
+                        raise YTDLError(f"No results found for search query")
+                else:
+                    logger.info(f"URL is a playlist, using first entry: {url}")
+                    data = data['entries'][0]
                 
                 # Check if the entry is valid
                 if not data:
-                    logger.error(f"Empty entry in playlist for URL: {url}")
-                    raise YTDLError(f"Empty entry in playlist for URL: {url}")
+                    logger.error(f"Empty entry in result for URL: {url}")
+                    raise YTDLError(f"Empty entry for URL: {url}")
         except Exception as e:
             logger.error(f"Error extracting info for URL {url}: {str(e)}")
             logger.error(traceback.format_exc())
@@ -170,23 +216,42 @@ class YTDLSource(discord.PCMVolumeTransformer):
 
         filename = data['url'] if stream else ydl.prepare_filename(data)
         
+        # Get the streaming URL from the data
+        if 'url' in data:
+            filename = data['url']  # Direct URL to the audio stream
+            logger.info(f"Using direct URL from data for streaming")
+        else:
+            filename = data.get('webpage_url', url)  # Fallback to webpage URL or original URL
+            logger.warning(f"No direct URL found, using webpage URL: {filename}")
+        
+        # Update the player URL if it wasn't set
+        if not data.get('webpage_url') and url.startswith('ytsearch:'):
+            data['webpage_url'] = data.get('url', filename)
+            logger.info(f"Setting webpage_url for search result: {data.get('webpage_url')}")
+        
         # Cache the data for future use
         song_cache[url] = data
         logger.info(f"Cached data for URL: {url}")
         
+        # Log important data for debugging
+        logger.info(f"Title: {data.get('title')}, URL: {data.get('webpage_url')}, Stream URL: {filename}")
+        
         ffmpeg_options = {
-            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin -nostdin',
-            'options': '-vn -bufsize 128k -ar 48000 -ac 2 -f s16le -loglevel warning -af "aresample=48000:first_pts=0"'
+            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+            'options': '-vn'
         }
         
-        # Create the audio source with a small delay to ensure proper initialization
+        # Create the audio source
         audio_source = discord.FFmpegPCMAudio(filename, **ffmpeg_options)
         
         # Add a small delay to ensure the source is properly initialized
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.5)
         
         logger.info(f"Created YTDLSource for URL: {url}, title: {data.get('title')}")
-        return cls(audio_source, data=data)
+        # Ensure volume is set at a good audible level
+        source = cls(audio_source, data=data)
+        source.volume = 0.8  # Set a slightly higher volume to ensure audibility
+        return source
         
     def cleanup(self):
         """Clean up resources when the source is done."""
@@ -302,7 +367,6 @@ class MusicControls(discord.ui.View):
                 
                 # Clear the current song
                 current_song[guild_id] = None
-                await interaction.followup.send("⏭ Skipped. No more songs in the queue.", ephemeral=True)
         finally:
             # Release the lock
             playing_locks[guild_id] = False
@@ -484,10 +548,21 @@ async def play(ctx, *, search: str):
                 if ctx.guild.id not in queues:
                     queues[ctx.guild.id] = deque()
                 queues[ctx.guild.id].append(search)
-                await ctx.send(f"Added to queue: {search}")
+                
+                # Different message based on whether it's a URL or search term
+                if YTDLSource.is_url(search):
+                    await ctx.send(f"🎵 Added to queue: {search}")
+                else:
+                    await ctx.send(f"🎵 Added to queue: '{search}' (will search YouTube)")
+                
             else:
                 try:
                     logger.info(f"Creating player for: {search}")
+                    
+                    # Show searching message if it's a search query
+                    if not YTDLSource.is_url(search):
+                        await ctx.send(f"🔍 Searching YouTube for: '{search}'...")
+                        
                     player = await YTDLSource.from_url(search, loop=bot.loop, stream=True)
                     
                     # Add a small delay to ensure buffer is filled
@@ -497,6 +572,10 @@ async def play(ctx, *, search: str):
                     ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop).result() if e is None else None)
                     current_song[ctx.guild.id] = player
 
+                    # If this was a search query, show what was found
+                    if not YTDLSource.is_url(search):
+                        await ctx.send(f"🎵 Found and playing: **{player.title}**")
+                        
                     await update_music_message(ctx, player)
 
                 except YTDLError as e:
@@ -532,10 +611,33 @@ async def update_music_message(ctx, player):
         except discord.NotFound:
             logger.warning(f"Old music message not found in guild {guild_id}")
 
-    video_id = player.url.split("v=")[-1]
-    thumbnail_url = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+    # Safely extract video ID for thumbnail
+    thumbnail_url = "https://i.imgur.com/ufxvZ0j.png"  # Default music thumbnail
+    if player.url:
+        try:
+            if "v=" in player.url:
+                video_id = player.url.split("v=")[-1]
+                # Remove any additional parameters
+                if "&" in video_id:
+                    video_id = video_id.split("&")[0]
+                thumbnail_url = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+            elif "youtu.be/" in player.url:
+                video_id = player.url.split("youtu.be/")[-1]
+                # Remove any additional parameters
+                if "?" in video_id:
+                    video_id = video_id.split("?")[0]
+                thumbnail_url = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+        except Exception as e:
+            logger.warning(f"Could not extract video ID from URL: {player.url}. Error: {e}")
+            # Use default thumbnail
 
-    embed = discord.Embed(title="🎵 Now Playing", description=f"**[{player.title}]({player.url})**", color=discord.Color.blue())
+    # Create proper description based on whether we have a URL
+    if player.url:
+        embed_description = f"**[{player.title}]({player.url})**"
+    else:
+        embed_description = f"**{player.title}**"
+        
+    embed = discord.Embed(title="🎵 Now Playing", description=embed_description, color=discord.Color.blue())
     embed.set_thumbnail(url=thumbnail_url)
     embed.add_field(name="Queue Length", value=str(len(queues.get(ctx.guild.id, []))), inline=False)
     view = MusicControls(ctx)
@@ -970,7 +1072,7 @@ async def skip(ctx):
             
             # Clear the current song
             current_song[guild_id] = None
-            await ctx.send("⏭ Skipped. No more songs in the queue.")
+            await ctx.send("⏭ Skipped. No more songs in the queue.", ephemeral=True)
     finally:
         # Release the lock
         playing_locks[guild_id] = False
@@ -1274,6 +1376,28 @@ async def on_voice_state_update(member, before, after):
         if guild_id in playing_locks:
             logger.info(f"Resetting playing lock in guild {guild_id}")
             playing_locks[guild_id] = False
+
+@bot.command()
+async def volume(ctx, volume: int):
+    """Change the volume of the player (0-150)."""
+    logger.info(f"Volume command used by {ctx.author} in guild {ctx.guild.id} with volume: {volume}")
+    
+    if not ctx.voice_client:
+        return await ctx.send("❌ I'm not connected to a voice channel.")
+        
+    if not ctx.voice_client.is_playing():
+        return await ctx.send("❌ Nothing is playing right now.")
+    
+    # Clamp volume between 0 and 150
+    volume = max(0, min(150, volume))
+    
+    # Convert to a float value between 0 and 1.5
+    guild_id = ctx.guild.id
+    if guild_id in current_song and current_song[guild_id]:
+        current_song[guild_id].volume = volume / 100
+        await ctx.send(f"🔊 Volume set to {volume}%")
+    else:
+        await ctx.send("❌ Couldn't find the current song.")
 
 # Create a function to ensure the cookies file exists
 def ensure_cookies_file():
