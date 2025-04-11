@@ -10,6 +10,12 @@ import re
 import logging
 import datetime
 import traceback
+import atexit
+import threading
+import time
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+from flask_socketio import SocketIO, join_room, leave_room
 
 # Set up logging
 logging.basicConfig(
@@ -30,6 +36,30 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is not set in the environment variables!")
+
+# Create a PID file to indicate that the bot is running
+def create_pid_file():
+    """Create a PID file for the bot to allow detection by other processes"""
+    pid = os.getpid()
+    with open("bot.pid", "w") as f:
+        f.write(str(pid))
+    logger.info(f"Created PID file with PID: {pid}")
+
+# Remove PID file on exit
+def remove_pid_file():
+    """Remove the PID file when the bot shuts down"""
+    try:
+        if os.path.exists("bot.pid"):
+            os.remove("bot.pid")
+            logger.info("Removed PID file")
+    except Exception as e:
+        logger.error(f"Error removing PID file: {e}")
+
+# Create the PID file at startup
+create_pid_file()
+
+# Register cleanup handler
+atexit.register(remove_pid_file)
 
 # Global dictionaries for queues and currently playing song message
 queues = {}
@@ -555,6 +585,12 @@ async def play(ctx, *, search: str):
                 else:
                     await ctx.send(f"🎵 Added to queue: '{search}' (will search YouTube)")
                 
+                # Emit queue update for dashboard
+                emit_to_guild(ctx.guild.id, 'queue_update', {
+                    'guild_id': str(ctx.guild.id),
+                    'queue': queue_to_list(str(ctx.guild.id)),
+                    'action': 'add'
+                })
             else:
                 try:
                     logger.info(f"Creating player for: {search}")
@@ -577,6 +613,13 @@ async def play(ctx, *, search: str):
                         await ctx.send(f"🎵 Found and playing: **{player.title}**")
                         
                     await update_music_message(ctx, player)
+                    
+                    # Emit song update for dashboard
+                    emit_to_guild(ctx.guild.id, 'song_update', {
+                        'guild_id': str(ctx.guild.id),
+                        'current_song': song_to_dict(player),
+                        'action': 'play'
+                    })
 
                 except YTDLError as e:
                     logger.error(f"YTDL error for search: {search} - {str(e)}")
@@ -694,6 +737,13 @@ async def play_next(ctx):
                             await current_song_message[guild_id].edit(embed=embed, view=None)
                         except discord.NotFound:
                             pass
+                            
+                    # Emit socket events for queue end
+                    emit_to_guild(guild_id, 'song_update', {
+                        'guild_id': str(guild_id),
+                        'current_song': None,
+                        'action': 'queue_end'
+                    })
                     return
             else:
                 logger.info(f"Using preloaded song in guild {guild_id}: {player.title}")
@@ -716,6 +766,19 @@ async def play_next(ctx):
                     current_song[guild_id] = player
                     
                     await update_music_message(ctx, player)
+                    
+                    # Emit socket events for new song
+                    emit_to_guild(guild_id, 'song_update', {
+                        'guild_id': str(guild_id),
+                        'current_song': song_to_dict(player),
+                        'action': 'play'
+                    })
+                    emit_to_guild(guild_id, 'queue_update', {
+                        'guild_id': str(guild_id),
+                        'queue': queue_to_list(guild_id),
+                        'action': 'update'
+                    })
+                    
                 except Exception as e:
                     logger.error(f"Error playing preloaded song in guild {guild_id}: {e}")
                     logger.error(traceback.format_exc())
@@ -765,6 +828,18 @@ async def play_next(ctx):
                 
                 # Update the now playing message
                 await update_music_message(ctx, player)
+                
+                # Emit socket events for new song
+                emit_to_guild(guild_id, 'song_update', {
+                    'guild_id': str(guild_id),
+                    'current_song': song_to_dict(player),
+                    'action': 'play'
+                })
+                emit_to_guild(guild_id, 'queue_update', {
+                    'guild_id': str(guild_id),
+                    'queue': queue_to_list(guild_id),
+                    'action': 'update'
+                })
                 
                 # Start preloading the next song
                 logger.info(f"Starting preload for next song in guild {guild_id}")
@@ -819,6 +894,13 @@ async def play_next(ctx):
                         pass
                 # Clear the current song
                 current_song[guild_id] = None
+                
+                # Emit socket events for queue end
+                emit_to_guild(guild_id, 'song_update', {
+                    'guild_id': str(guild_id),
+                    'current_song': None,
+                    'action': 'queue_end'
+                })
     finally:
         # Release the lock
         playing_locks[guild_id] = False
@@ -936,6 +1018,13 @@ async def handle_playlist(ctx, url):
         logger.info(f"Fixing queue after adding playlist for guild {ctx.guild.id}")
         await fix_queue(ctx.guild.id)
         
+        # Emit queue update for dashboard
+        emit_to_guild(ctx.guild.id, 'queue_update', {
+            'guild_id': str(ctx.guild.id),
+            'queue': queue_to_list(str(ctx.guild.id)),
+            'action': 'add_playlist'
+        })
+        
         # If the bot is not already playing, start playing the first song
         if not ctx.voice_client or not ctx.voice_client.is_playing():
             if queues[ctx.guild.id]:
@@ -953,6 +1042,14 @@ async def handle_playlist(ctx, url):
                     
                     await update_music_message(ctx, player)
                     await ctx.send(f"🎵 Playing playlist. Added {len(queues[ctx.guild.id])} songs to the queue.")
+                    
+                    # Emit song update for dashboard
+                    emit_to_guild(ctx.guild.id, 'song_update', {
+                        'guild_id': str(ctx.guild.id),
+                        'current_song': song_to_dict(player),
+                        'action': 'play'
+                    })
+                    
                 except Exception as e:
                     logger.error(f"Error playing first song from playlist in guild {ctx.guild.id}: {e}")
                     logger.error(traceback.format_exc())
@@ -964,7 +1061,6 @@ async def handle_playlist(ctx, url):
             # If already playing, just add to queue
             logger.info(f"Bot already playing, added {len(queues[ctx.guild.id])} songs from playlist to queue for guild {ctx.guild.id}")
             await ctx.send(f"🎵 Added {len(queues[ctx.guild.id])} songs from the playlist to the queue.")
-
 
 @bot.command()
 async def leave(ctx):
@@ -1054,6 +1150,19 @@ async def skip(ctx):
                 await update_music_message(ctx, player)
                 
                 await ctx.send(f"⏭ Skipped to: **{player.title}**")
+                
+                # Emit socket events to update dashboard
+                emit_to_guild(guild_id, 'song_update', {
+                    'guild_id': str(guild_id),
+                    'current_song': song_to_dict(player),
+                    'action': 'skip'
+                })
+                emit_to_guild(guild_id, 'queue_update', {
+                    'guild_id': str(guild_id),
+                    'queue': queue_to_list(str(guild_id)),
+                    'action': 'update'
+                })
+                
             except Exception as e:
                 logger.error(f"Error playing next song after skip in guild {guild_id}: {e}")
                 logger.error(traceback.format_exc())
@@ -1073,6 +1182,13 @@ async def skip(ctx):
             # Clear the current song
             current_song[guild_id] = None
             await ctx.send("⏭ Skipped. No more songs in the queue.", ephemeral=True)
+            
+            # Emit socket events to update dashboard that no song is playing
+            emit_to_guild(guild_id, 'song_update', {
+                'guild_id': str(guild_id),
+                'current_song': None,
+                'action': 'skip'
+            })
     finally:
         # Release the lock
         playing_locks[guild_id] = False
@@ -1154,199 +1270,6 @@ async def debug(ctx):
     
     # Send the debug information
     await ctx.send(embed=embed)
-
-@bot.command()
-async def checkduplicates(ctx):
-    """Checks for duplicate songs in the queue."""
-    logger.info(f"Checkduplicates command used by {ctx.author} in guild {ctx.guild.id}")
-    
-    guild_id = ctx.guild.id
-    
-    if guild_id not in queues or not queues[guild_id]:
-        logger.info(f"Queue is empty for guild {guild_id}")
-        await ctx.send("📋 The queue is empty.")
-        return
-    
-    # Create a set to track unique URLs
-    unique_urls = set()
-    duplicates = []
-    
-    # Check for duplicates
-    for url in queues[guild_id]:
-        if url in unique_urls:
-            duplicates.append(url)
-        else:
-            unique_urls.add(url)
-    
-    # Create an embed to display the results
-    embed = discord.Embed(title="🔍 Duplicate Check", color=discord.Color.blue())
-    
-    if duplicates:
-        # Extract video IDs for the duplicates
-        duplicate_list = ""
-        for i, url in enumerate(duplicates, 1):
-            try:
-                # Use a simple regex to extract video ID
-                video_id = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url)
-                if video_id:
-                    video_id = video_id.group(1)
-                    duplicate_list += f"{i}. [Video](https://www.youtube.com/watch?v={video_id})\n"
-                else:
-                    duplicate_list += f"{i}. {url}\n"
-            except:
-                duplicate_list += f"{i}. {url}\n"
-        
-        embed.add_field(name="Duplicates Found", value=f"Found {len(duplicates)} duplicate songs in the queue.", inline=False)
-        embed.add_field(name="Duplicate Songs", value=duplicate_list, inline=False)
-        
-        # Add a button to remove duplicates
-        view = RemoveDuplicatesView(ctx)
-        await ctx.send(embed=embed, view=view)
-    else:
-        embed.add_field(name="Result", value="✅ No duplicate songs found in the queue.", inline=False)
-        await ctx.send(embed=embed)
-
-
-class RemoveDuplicatesView(discord.ui.View):
-    def __init__(self, ctx):
-        super().__init__(timeout=60)  # 60 second timeout
-        self.ctx = ctx
-
-    @discord.ui.button(label="Remove Duplicates", style=discord.ButtonStyle.red)
-    async def remove_duplicates(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Defer the response immediately to prevent timeout
-        await interaction.response.defer(ephemeral=True)
-        
-        guild_id = self.ctx.guild.id
-        logger.info(f"Remove duplicates button pressed in guild {guild_id}")
-        
-        if guild_id not in queues or not queues[guild_id]:
-            logger.warning(f"Remove duplicates button pressed but queue is empty in guild {guild_id}")
-            await interaction.followup.send("❌ The queue is empty.", ephemeral=True)
-            return
-        
-        # Create a new queue with only unique URLs
-        new_queue = deque()
-        unique_urls = set()
-        
-        # Add only unique URLs to the new queue
-        for url in queues[guild_id]:
-            if url not in unique_urls:
-                unique_urls.add(url)
-                new_queue.append(url)
-        
-        # Count how many duplicates were removed
-        removed_count = len(queues[guild_id]) - len(new_queue)
-        
-        # Replace the old queue with the new one
-        queues[guild_id] = new_queue
-        
-        # Disable the button
-        self.remove_duplicates.disabled = True
-        
-        # Update the message
-        embed = discord.Embed(title="✅ Duplicates Removed", description=f"Removed {removed_count} duplicate songs from the queue.", color=discord.Color.green())
-        await interaction.message.edit(embed=embed, view=self)
-        
-        logger.info(f"Removed {removed_count} duplicate songs from queue in guild {guild_id}")
-        await interaction.followup.send(f"✅ Removed {removed_count} duplicate songs from the queue.", ephemeral=True)
-
-@bot.command()
-async def fixqueue(ctx):
-    """Manually fixes the queue by removing duplicates."""
-    logger.info(f"Fixqueue command used by {ctx.author} in guild {ctx.guild.id}")
-    
-    guild_id = ctx.guild.id
-    
-    if guild_id not in queues or not queues[guild_id]:
-        logger.info(f"Queue is empty for guild {guild_id}")
-        await ctx.send("📋 The queue is empty.")
-        return
-    
-    # Get the original queue length
-    original_length = len(queues[guild_id])
-    
-    # Fix the queue
-    new_length = await fix_queue(guild_id)
-    
-    # Calculate how many duplicates were removed
-    removed_count = original_length - new_length
-    
-    if removed_count > 0:
-        logger.info(f"Fixed queue by removing {removed_count} duplicate songs in guild {guild_id}")
-        await ctx.send(f"✅ Fixed the queue by removing {removed_count} duplicate songs.")
-    else:
-        logger.info(f"Queue is already clean with no duplicates in guild {guild_id}")
-        await ctx.send("✅ The queue is already clean with no duplicates.")
-
-@bot.command()
-async def diagnose(ctx):
-    """Diagnoses and fixes common issues with the bot."""
-    logger.info(f"Diagnose command used by {ctx.author} in guild {ctx.guild.id}")
-    
-    guild_id = ctx.guild.id
-    issues_found = []
-    fixes_applied = []
-    
-    # Create an embed for the diagnosis results
-    embed = discord.Embed(title="🔍 Bot Diagnosis", color=discord.Color.blue())
-    
-    # Check voice client status
-    if not ctx.voice_client:
-        issues_found.append("Bot is not connected to a voice channel")
-    else:
-        embed.add_field(name="Voice Client", value=f"Connected: {ctx.voice_client.is_connected()}\nPlaying: {ctx.voice_client.is_playing()}\nPaused: {ctx.voice_client.is_paused()}", inline=False)
-    
-    # Check queue status
-    if guild_id not in queues:
-        issues_found.append("Queue does not exist")
-        queues[guild_id] = deque()
-        fixes_applied.append("Created new queue")
-    elif not queues[guild_id]:
-        embed.add_field(name="Queue", value="Empty", inline=False)
-    else:
-        # Check for duplicates
-        original_length = len(queues[guild_id])
-        new_length = await fix_queue(guild_id)
-        if original_length != new_length:
-            issues_found.append(f"Found {original_length - new_length} duplicate songs in queue")
-            fixes_applied.append(f"Removed {original_length - new_length} duplicate songs")
-        
-        embed.add_field(name="Queue", value=f"Length: {len(queues[guild_id])}", inline=False)
-    
-    # Check current song status
-    if guild_id in current_song and current_song[guild_id]:
-        embed.add_field(name="Current Song", value=f"Title: {current_song[guild_id].title}\nURL: {current_song[guild_id].url}", inline=False)
-    else:
-        embed.add_field(name="Current Song", value="None", inline=False)
-    
-    # Check preloaded song status
-    if guild_id in preloaded_songs and preloaded_songs[guild_id]:
-        embed.add_field(name="Preloaded Song", value=f"Title: {preloaded_songs[guild_id].title}\nURL: {preloaded_songs[guild_id].url}", inline=False)
-    else:
-        embed.add_field(name="Preloaded Song", value="None", inline=False)
-    
-    # Check lock status
-    if guild_id in playing_locks and playing_locks[guild_id]:
-        issues_found.append("Playing lock is stuck (might be causing playback issues)")
-        playing_locks[guild_id] = False
-        fixes_applied.append("Reset playing lock")
-    
-    embed.add_field(name="Lock Status", value=f"Playing Lock: {playing_locks.get(guild_id, False)}", inline=False)
-    
-    # Add issues and fixes to the embed
-    if issues_found:
-        embed.add_field(name="Issues Found", value="\n".join([f"• {issue}" for issue in issues_found]), inline=False)
-    else:
-        embed.add_field(name="Issues Found", value="✅ No issues found", inline=False)
-    
-    if fixes_applied:
-        embed.add_field(name="Fixes Applied", value="\n".join([f"• {fix}" for fix in fixes_applied]), inline=False)
-    else:
-        embed.add_field(name="Fixes Applied", value="No fixes were needed", inline=False)
-    
-    # Send the diagnosis results
-    await ctx.send(embed=embed)
     
     # If there were issues, try to play the next song
     if issues_found and ctx.voice_client and not ctx.voice_client.is_playing():
@@ -1414,4 +1337,857 @@ def ensure_cookies_file():
         logger.error(f"Error creating cookies file: {e}")
         return False
 
-bot.run(BOT_TOKEN)
+# Initialize Flask app
+app = Flask(__name__, static_folder='dashboard/frontend/build')
+CORS(app)
+socketio = SocketIO(
+    app, 
+    cors_allowed_origins="*",
+    logger=True,  # Enable Socket.IO logging
+    engineio_logger=True,  # Enable Engine.IO logging
+    ping_timeout=60,  # Increase ping timeout for better connection stability
+    ping_interval=25,  # Adjust ping interval
+    async_mode='threading'  # Explicitly use threading mode
+)
+
+# Store connected clients by guild_id
+connected_clients = {}
+
+# API Routes
+@app.route('/api/status', methods=['GET'])
+def get_status():
+    """Get overall status info about the bot"""
+    bot_status = {
+        "user": {
+            "name": bot.user.name if bot.user else "Unknown",
+            "id": str(bot.user.id) if bot.user else "Unknown"
+        },
+        "guilds": len(bot.guilds),
+        "active_servers": len(current_song)
+    }
+    
+    return jsonify(bot_status)
+
+@app.route('/api/guilds', methods=['GET'])
+def get_guilds():
+    """Get list of guilds the bot is in"""
+    guilds_data = []
+    for guild in bot.guilds:
+        guilds_data.append({
+            'id': str(guild.id),
+            'name': guild.name,
+            'is_playing': str(guild.id) in current_song and current_song[str(guild.id)] is not None
+        })
+    
+    return jsonify(guilds_data)
+
+@app.route('/api/guild/<guild_id>', methods=['GET'])
+def get_guild_info(guild_id):
+    """Get detailed information about a specific guild"""
+    # Convert to string for consistency
+    guild_id = str(guild_id)
+    
+    # Find the guild
+    guild = None
+    for g in bot.guilds:
+        if str(g.id) == guild_id:
+            guild = g
+            break
+    
+    if not guild:
+        return jsonify({"error": "Guild not found"}), 404
+    
+    # Get guild information
+    guild_info = {
+        'id': str(guild.id),
+        'name': guild.name,
+        'member_count': guild.member_count,
+        'voice_connected': False,  # Default value
+        'is_playing': guild_id in current_song and current_song[guild_id] is not None,
+        'current_song': song_to_dict(current_song.get(guild_id)),
+        'queue': queue_to_list(guild_id),
+        'queue_length': len(queues.get(guild_id, []))
+    }
+    
+    # Check if the bot is connected to a voice channel in this guild
+    for vc in bot.voice_clients:
+        if str(vc.guild.id) == guild_id:
+            guild_info['voice_connected'] = True
+            guild_info['is_paused'] = vc.is_paused()
+            break
+    
+    return jsonify(guild_info)
+
+@app.route('/api/guild/<guild_id>/queue', methods=['GET'])
+def get_queue(guild_id):
+    """Get the current queue for a specific guild"""
+    guild_id = str(guild_id)
+    queue_list = queue_to_list(guild_id)
+    
+    return jsonify({
+        'queue': queue_list,
+        'length': len(queue_list)
+    })
+
+@app.route('/api/guild/<guild_id>/current', methods=['GET'])
+def get_current_song(guild_id):
+    """Get the currently playing song for a specific guild"""
+    guild_id = str(guild_id)
+    
+    if guild_id not in current_song or current_song[guild_id] is None:
+        return jsonify({'current_song': None})
+    
+    song_data = song_to_dict(current_song[guild_id])
+    song_data['thumbnail'] = get_thumbnail_url(song_data.get('url'))
+    
+    return jsonify({'current_song': song_data})
+
+@app.route('/api/guild/<guild_id>/volume', methods=['POST'])
+def set_volume(guild_id):
+    """Set the volume for a specific guild"""
+    guild_id = str(guild_id)
+    
+    # Get volume from request body
+    data = request.json
+    if not data or 'volume' not in data:
+        return jsonify({"error": "Volume parameter is required"}), 400
+        
+    volume = int(data['volume'])
+    # Clamp volume between 0 and 150
+    volume = max(0, min(150, volume))
+    
+    # Find the guild in bot's guilds
+    guild = None
+    for g in bot.guilds:
+        if str(g.id) == guild_id:
+            guild = g
+            break
+            
+    if not guild:
+        return jsonify({"error": "Guild not found"}), 404
+        
+    # Check if bot is in a voice channel in this guild
+    voice_client = None
+    for vc in bot.voice_clients:
+        if str(vc.guild.id) == guild_id:
+            voice_client = vc
+            break
+            
+    if not voice_client:
+        return jsonify({"error": "Bot not connected to a voice channel"}), 400
+        
+    if not voice_client.is_playing():
+        return jsonify({"error": "Nothing is playing right now"}), 400
+    
+    # Set the volume on the current song
+    if guild_id in current_song and current_song[guild_id]:
+        current_song[guild_id].volume = volume / 100
+        
+        # Also update the song dictionary to reflect new volume
+        emit_to_guild(guild_id, 'song_update', {
+            'guild_id': guild_id,
+            'current_song': song_to_dict(current_song[guild_id]),
+            'action': 'volume_change'
+        })
+        
+        return jsonify({"success": True, "volume": volume})
+    else:
+        return jsonify({"error": "Couldn't find the current song"}), 400
+
+@app.route('/api/guild/<guild_id>/pause', methods=['POST'])
+def pause_playback(guild_id):
+    """Pause the current playback"""
+    guild_id = str(guild_id)
+    
+    # Find the guild's voice client
+    voice_client = None
+    for vc in bot.voice_clients:
+        if str(vc.guild.id) == guild_id:
+            voice_client = vc
+            break
+            
+    if not voice_client:
+        return jsonify({"error": "Bot not connected to a voice channel"}), 400
+        
+    if not voice_client.is_playing():
+        return jsonify({"error": "Nothing is playing right now"}), 400
+        
+    if voice_client.is_paused():
+        return jsonify({"error": "Playback is already paused"}), 400
+        
+    # Pause the playback
+    voice_client.pause()
+    
+    # Emit socket event to update UI
+    emit_to_guild(guild_id, 'song_update', {
+        'guild_id': guild_id,
+        'is_paused': True,
+        'action': 'pause'
+    })
+    
+    return jsonify({"success": True, "message": "Playback paused"})
+    
+@app.route('/api/guild/<guild_id>/resume', methods=['POST'])
+def resume_playback(guild_id):
+    """Resume the paused playback"""
+    guild_id = str(guild_id)
+    
+    # Find the guild's voice client
+    voice_client = None
+    for vc in bot.voice_clients:
+        if str(vc.guild.id) == guild_id:
+            voice_client = vc
+            break
+            
+    if not voice_client:
+        return jsonify({"error": "Bot not connected to a voice channel"}), 400
+        
+    if not voice_client.is_paused():
+        return jsonify({"error": "Playback is not paused"}), 400
+        
+    # Resume the playback
+    voice_client.resume()
+    
+    # Emit socket event to update UI
+    emit_to_guild(guild_id, 'song_update', {
+        'guild_id': guild_id,
+        'is_paused': False,
+        'action': 'resume'
+    })
+    
+    return jsonify({"success": True, "message": "Playback resumed"})
+    
+@app.route('/api/guild/<guild_id>/skip', methods=['POST'])
+def skip_song(guild_id):
+    """Skip the current song"""
+    guild_id = str(guild_id)
+    
+    # Find the guild's voice client
+    voice_client = None
+    for vc in bot.voice_clients:
+        if str(vc.guild.id) == guild_id:
+            voice_client = vc
+            break
+            
+    if not voice_client:
+        return jsonify({"error": "Bot not connected to a voice channel"}), 400
+        
+    if not voice_client.is_playing() and not voice_client.is_paused():
+        return jsonify({"error": "Nothing is playing right now"}), 400
+    
+    # Stop current playback to trigger the 'after' callback which will play the next song
+    voice_client.stop()
+    
+    return jsonify({"success": True, "message": "Skipped to next song"})
+    
+@app.route('/api/guild/<guild_id>/stop', methods=['POST'])
+def stop_playback(guild_id):
+    """Stop playback and clear the queue"""
+    guild_id = str(guild_id)
+    
+    # Find the guild's voice client
+    voice_client = None
+    for vc in bot.voice_clients:
+        if str(vc.guild.id) == guild_id:
+            voice_client = vc
+            break
+            
+    if not voice_client:
+        return jsonify({"error": "Bot not connected to a voice channel"}), 400
+    
+    # Clear the queue
+    if guild_id in queues:
+        queues[guild_id].clear()
+    
+    # Stop playback if something is playing
+    if voice_client.is_playing() or voice_client.is_paused():
+        voice_client.stop()
+        current_song[guild_id] = None
+    
+    # Emit socket events to update UI
+    emit_to_guild(guild_id, 'song_update', {
+        'guild_id': guild_id,
+        'current_song': None,
+        'is_playing': False,
+        'action': 'stop'
+    })
+    
+    emit_to_guild(guild_id, 'queue_update', {
+        'guild_id': guild_id,
+        'queue': [],
+        'queue_length': 0,
+        'action': 'clear'
+    })
+    
+    return jsonify({"success": True, "message": "Playback stopped and queue cleared"})
+
+# Add this function above the Flask routes section
+
+def run_async(coro):
+    """Run async code in a separate thread through a Future object"""
+    loop = asyncio.get_event_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    try:
+        return future.result(timeout=60)  # Set a reasonable timeout
+    except Exception as e:
+        logger.error(f"Error in async task: {e}")
+        logger.error(traceback.format_exc())
+        return None
+
+# Then modify the play_song function to use this helper
+
+
+async def play_from_queue(guild, voice_channel):
+    """Start playing songs from the queue for the given guild and voice channel."""
+    logger.info(f"play_from_queue called for guild {guild.id}")
+    
+    guild_id = str(guild.id)
+    
+    # Create a context-like object for play_next
+    class FakeContext:
+        def __init__(self, guild, voice_client):
+            self.guild = guild
+            self.voice_client = voice_client
+            self.channel = None  # Will be set later
+            
+        async def invoke(self, command):
+            logger.info(f"Fake context invoking {command.__name__}")
+            # Simplified handling - we assume the bot is already connected
+            pass
+            
+        async def send(self, content=None, *, embed=None, ephemeral=False, view=None):
+            logger.info(f"Fake context send: {content}")
+            # No actual sending, just log
+            pass
+            
+    # Wait a moment to ensure everything is ready
+    await asyncio.sleep(0.5)
+    
+    # Find the voice client for this guild
+    voice_client = None
+    for vc in bot.voice_clients:
+        if str(vc.guild.id) == guild_id:
+            voice_client = vc
+            break
+    
+    if not voice_client:
+        logger.error(f"No voice client found for guild {guild_id} in play_from_queue")
+        return
+    
+    # Create a fake context
+    fake_ctx = FakeContext(guild, voice_client)
+    fake_ctx.channel = voice_channel
+    
+    # Check if there are songs in the queue
+    if guild_id in queues and queues[guild_id]:
+        # Use play_next to start playing from the queue
+        await play_next(fake_ctx)
+    else:
+        logger.warning(f"No songs in queue for guild {guild_id} in play_from_queue")
+
+
+@app.route('/api/guild/<guild_id>/play', methods=['POST'])
+def play_song(guild_id):
+    """Add a song to the queue and play it if nothing is playing"""
+    guild_id = str(guild_id)
+    
+    # Get URL from request body
+    data = request.json
+    if not data or 'url' not in data:
+        return jsonify({"error": "URL parameter is required"}), 400
+    
+    search = data['url']  # This can be a URL or search term
+    
+    # Find the guild
+    guild = None
+    for g in bot.guilds:
+        if str(g.id) == guild_id:
+            guild = g
+            break
+            
+    if not guild:
+        return jsonify({"error": "Guild not found"}), 404
+    
+    # Initialize queue if it doesn't exist
+    if guild_id not in queues:
+        queues[guild_id] = deque()
+    
+    # Find voice client for this guild
+    voice_client = None
+    for vc in bot.voice_clients:
+        if str(vc.guild.id) == guild_id:
+            voice_client = vc
+            break
+    
+    # Create a fake context for bot command simulation
+    class FakeContext:
+        def __init__(self, guild, voice_client=None):
+            self.guild = guild
+            self.voice_client = voice_client
+            self.author = guild.me  # Use the bot as the author
+            self.channel = None    # Will be set if available
+            
+        async def invoke(self, command):
+            logger.info(f"Fake context invoking {command.__name__}")
+            if command == join and voice_client is None:
+                # For joining voice channels - find the most populated voice channel
+                voice_channels = guild.voice_channels
+                target_channel = None
+                max_members = -1
+                
+                for vc in voice_channels:
+                    if len(vc.members) > max_members:
+                        max_members = len(vc.members)
+                        target_channel = vc
+                
+                if target_channel:
+                    logger.info(f"Joining voice channel {target_channel.name} in guild {guild.id}")
+                    try:
+                        self.voice_client = await target_channel.connect()
+                        return True
+                    except Exception as e:
+                        logger.error(f"Error joining voice channel: {e}")
+                        return False
+            return False
+            
+        async def send(self, content=None, *, embed=None, ephemeral=False, view=None):
+            logger.info(f"API would have sent: {content}")
+            return None
+            
+        async def typing(self):
+            class TypingContextManager:
+                async def __aenter__(self):
+                    return None
+                async def __aexit__(self, exc_type, exc_val, exc_tb):
+                    return None
+            return TypingContextManager()
+    
+    # If the user submitted a playlist URL
+    if 'list=' in search:
+        # Call the playlist handler async function via the helper
+        if voice_client:
+            fake_ctx = FakeContext(guild, voice_client)
+            run_async(handle_playlist(fake_ctx, search))
+            return jsonify({"success": True, "message": "Processing playlist"})
+        else:
+            # Need to join a voice channel first
+            return jsonify({"error": "Bot not in a voice channel. Please join a voice channel first."}), 400
+            
+    # For regular URLs or search terms, emulate the logic from the play command:
+    
+    # If we're already playing something, just add to queue
+    if voice_client and voice_client.is_playing():
+        logger.info(f"Bot already playing, adding to queue: {search}")
+        queues[guild_id].append(search)
+        
+        # Emit queue update for dashboard
+        emit_to_guild(guild_id, 'queue_update', {
+            'guild_id': guild_id,
+            'queue': queue_to_list(str(guild_id)),
+            'action': 'add'
+        })
+        
+        # Different message based on whether it's a URL or search term
+        if YTDLSource.is_url(search):
+            return jsonify({"success": True, "message": f"Added URL to queue: {search}"})
+        else:
+            return jsonify({"success": True, "message": f"Added to queue: '{search}' (will search YouTube)"})
+    
+    # If we're not playing anything, start playing
+    fake_ctx = FakeContext(guild, voice_client)
+    
+    # If we're not connected to a voice channel yet
+    if not voice_client:
+        # Try to join a voice channel
+        voice_channels = guild.voice_channels
+        if not voice_channels:
+            return jsonify({"error": "No voice channels available in this server"}), 400
+            
+        # Find the most populated voice channel
+        target_channel = None
+        max_members = -1
+        
+        for vc in voice_channels:
+            if len(vc.members) > max_members:
+                max_members = len(vc.members)
+                target_channel = vc
+                
+        if not target_channel:
+            return jsonify({"error": "No suitable voice channel found"}), 400
+            
+        try:
+            logger.info(f"API joining voice channel {target_channel.name} in guild {guild.id}")
+            voice_client = run_async(target_channel.connect())
+            fake_ctx.voice_client = voice_client
+        except Exception as e:
+            logger.error(f"Error joining voice channel: {e}")
+            return jsonify({"error": f"Failed to join voice channel: {str(e)}"}), 500
+    
+    # Now play the song
+    try:
+        # If it's a direct URL, try to play it directly
+        if YTDLSource.is_url(search):
+            # Add to queue and start playing with play_from_queue
+            queues[guild_id].append(search)
+            run_async(play_from_queue(guild, voice_client.channel))
+            return jsonify({"success": True, "message": f"Playing URL: {search}"})
+        else:
+            # It's a search term, queue it and start playing
+            queues[guild_id].append(search)
+            run_async(play_from_queue(guild, voice_client.channel))
+            return jsonify({"success": True, "message": f"Searching for and playing: '{search}'"})
+    except Exception as e:
+        logger.error(f"Error in play API endpoint: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": f"An error occurred: {str(e)}"}), 500
+
+@app.route('/api/guild/<guild_id>/queue/<int:index>', methods=['DELETE'])
+def remove_from_queue(guild_id, index):
+    """Remove a song from the queue at the given index"""
+    guild_id = str(guild_id)
+    
+    # Check if queue exists
+    if guild_id not in queues:
+        return jsonify({"error": "Queue not found"}), 404
+    
+    # Check if index is valid
+    if index < 0 or index >= len(queues[guild_id]):
+        return jsonify({"error": "Invalid queue index"}), 400
+    
+    # Remove the song at the specified index
+    try:
+        # Convert deque to list to allow index removal
+        queue_list = list(queues[guild_id])
+        removed_url = queue_list.pop(index)
+        queues[guild_id] = deque(queue_list)
+        
+        # Emit socket event to update UI
+        emit_to_guild(guild_id, 'queue_update', {
+            'guild_id': guild_id,
+            'queue': queue_to_list(guild_id),
+            'action': 'remove'
+        })
+        
+        return jsonify({"success": True, "message": "Removed from queue", "removed_url": removed_url})
+    except Exception as e:
+        return jsonify({"error": f"Failed to remove from queue: {str(e)}"}), 500
+
+@app.route('/api/guild/<guild_id>/queue/<int:index>/play', methods=['POST'])
+def play_from_index(guild_id, index):
+    """Skip to and play a specific song in the queue"""
+    guild_id = str(guild_id)
+    
+    # Check if queue exists
+    if guild_id not in queues:
+        return jsonify({"error": "Queue not found"}), 404
+    
+    # Check if index is valid
+    if index < 0 or index >= len(queues[guild_id]):
+        return jsonify({"error": "Invalid queue index"}), 400
+    
+    # Find the guild's voice client
+    voice_client = None
+    for vc in bot.voice_clients:
+        if str(vc.guild.id) == guild_id:
+            voice_client = vc
+            break
+            
+    if not voice_client:
+        return jsonify({"error": "Bot not connected to a voice channel"}), 400
+    
+    try:
+        # Get the URL at the specified index
+        queue_list = list(queues[guild_id])
+        selected_url = queue_list[index]
+        
+        # Rearrange the queue: remove all songs before the selected one
+        new_queue = deque([selected_url] + queue_list[index+1:])
+        queues[guild_id] = new_queue
+        
+        # Stop current playback to trigger playing the next song
+        voice_client.stop()
+        
+        # Emit socket event to update UI
+        emit_to_guild(guild_id, 'queue_update', {
+            'guild_id': guild_id,
+            'queue': queue_to_list(guild_id),
+            'action': 'reorder'
+        })
+        
+        return jsonify({"success": True, "message": "Playing selected song"})
+    except Exception as e:
+        return jsonify({"error": f"Failed to play from index: {str(e)}"}), 500
+
+@app.route('/api/guild/<guild_id>/queue/clear', methods=['POST'])
+def clear_queue(guild_id):
+    """Clear all songs from the queue"""
+    guild_id = str(guild_id)
+    
+    # Check if queue exists
+    if guild_id not in queues:
+        return jsonify({"error": "Queue not found"}), 404
+    
+    # Clear the queue
+    queues[guild_id].clear()
+    
+    # Emit socket event to update UI
+    emit_to_guild(guild_id, 'queue_update', {
+        'guild_id': guild_id,
+        'queue': [],
+        'queue_length': 0,
+        'action': 'clear'
+    })
+    
+    return jsonify({"success": True, "message": "Queue cleared"})
+
+@app.route('/api/debug', methods=['GET'])
+def debug():
+    """Debug endpoint to test if API is running"""
+    return jsonify({"status": "API is running", "bot": bot.user.name if bot.user else "Bot not connected"})
+
+# Serve React frontend
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve(path):
+    if path != "" and os.path.exists(app.static_folder + '/' + path):
+        return send_from_directory(app.static_folder, path)
+    else:
+        return send_from_directory(app.static_folder, 'index.html')
+
+# Socket events
+@socketio.on('connect')
+def connect():
+    logger.info(f"Client connected: {request.sid}")
+    logger.info(f"Socket.IO connection details - SID: {request.sid}, Transport: {request.environ.get('wsgi.websocket', 'Not WebSocket')}")
+
+@socketio.on('disconnect')
+def disconnect():
+    logger.info(f"Client disconnected: {request.sid}")
+    # Remove client from all guild rooms
+    for guild_id in list(connected_clients.keys()):
+        if request.sid in connected_clients[guild_id]:
+            connected_clients[guild_id].remove(request.sid)
+            leave_room(guild_id)
+            logger.info(f"Removed client {request.sid} from guild {guild_id} due to disconnect")
+
+@socketio.on('join_guild')
+def on_join_guild(data):
+    logger.info(f"Received join_guild request: {data}")
+    if 'guild_id' not in data:
+        logger.error(f"Client {request.sid} sent invalid join_guild request without guild_id")
+        return
+    
+    guild_id = str(data['guild_id'])
+    
+    # Add the client to the guild room
+    join_room(guild_id)
+    
+    # Track the client
+    if guild_id not in connected_clients:
+        connected_clients[guild_id] = set()
+    connected_clients[guild_id].add(request.sid)
+    
+    logger.info(f"Client {request.sid} joined guild {guild_id}")
+    
+    # Send an immediate update
+    try:
+        socketio.emit('song_update', {'guild_id': guild_id}, room=request.sid)
+        socketio.emit('queue_update', {'guild_id': guild_id}, room=request.sid)
+        logger.info(f"Sent initial updates to client {request.sid} for guild {guild_id}")
+    except Exception as e:
+        logger.error(f"Error sending initial updates to client {request.sid}: {e}")
+
+@socketio.on('leave_guild')
+def on_leave_guild(data):
+    """Handle client leaving a specific guild channel"""
+    guild_id = str(data.get('guild_id'))
+    logger.info(f"Client {request.sid} leaving guild {guild_id}")
+    
+    # Remove client from the guild's room
+    if guild_id in connected_clients and request.sid in connected_clients[guild_id]:
+        connected_clients[guild_id].remove(request.sid)
+        leave_room(guild_id)
+        logger.info(f"Removed client {request.sid} from guild {guild_id}")
+
+# Function to convert song data to a JSON-serializable format
+def song_to_dict(song):
+    if not song:
+        return None
+    
+    # Extract the required information
+    return {
+        'title': song.title if hasattr(song, 'title') else "Unknown",
+        'url': song.url if hasattr(song, 'url') else None,
+        'volume': song.volume * 100 if hasattr(song, 'volume') else 70  # Convert to percentage
+    }
+
+# Function to get thumbnail URL from YouTube URL
+def get_thumbnail_url(url):
+    if not url:
+        return "https://i.imgur.com/ufxvZ0j.png"  # Default music thumbnail
+    
+    try:
+        if "v=" in url:
+            video_id = url.split("v=")[-1]
+            # Remove any additional parameters
+            if "&" in video_id:
+                video_id = video_id.split("&")[0]
+            return f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+        elif "youtu.be/" in url:
+            video_id = url.split("youtu.be/")[-1]
+            # Remove any additional parameters
+            if "?" in video_id:
+                video_id = video_id.split("?")[0]
+            return f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+    except Exception as e:
+        logger.warning(f"Could not extract video ID from URL: {url}. Error: {e}")
+    
+    return "https://i.imgur.com/ufxvZ0j.png"  # Default music thumbnail
+
+# Function to convert queue data to a JSON-serializable format
+def queue_to_list(guild_id):
+    if guild_id not in queues:
+        return []
+    
+    queue_list = []
+    for url in queues[guild_id]:
+        queue_item = {
+            'url': url,
+            'thumbnail': get_thumbnail_url(url)
+        }
+        queue_list.append(queue_item)
+    
+    return queue_list
+
+# Function to emit socket event to clients in a guild
+def emit_to_guild(guild_id, event, data):
+    """Emit an event to all clients in a specific guild"""
+    guild_id = str(guild_id)
+    if guild_id in connected_clients and connected_clients[guild_id]:
+        logger.info(f"Emitting {event} to {len(connected_clients[guild_id])} clients in guild {guild_id}")
+        
+        # Make sure guild_id is included in the data
+        if 'guild_id' not in data:
+            data['guild_id'] = guild_id
+        
+        # Enhance data based on event type
+        if event == 'song_update' and 'current_song' not in data:
+            # Find voice client to check if paused
+            voice_client = None
+            for vc in bot.voice_clients:
+                if str(vc.guild.id) == guild_id:
+                    voice_client = vc
+                    break
+            
+            # Try to get song with guild ID as string and as int
+            song_obj = None
+            if guild_id in current_song:
+                song_obj = current_song[guild_id]
+            elif int(guild_id) in current_song:
+                song_obj = current_song[int(guild_id)]
+                # For consistency, update the current_song with string key
+                current_song[guild_id] = song_obj
+                
+            is_playing = song_obj is not None
+            is_paused = voice_client.is_paused() if voice_client else False
+            
+            # Get current song with more details
+            current_song_data = None
+            if song_obj is not None:
+                current_song_data = {
+                    'title': song_obj.title if hasattr(song_obj, 'title') else "Unknown",
+                    'url': song_obj.url if hasattr(song_obj, 'url') else None,
+                    'thumbnail': get_thumbnail_url(song_obj.url if hasattr(song_obj, 'url') else None),
+                    'volume': song_obj.volume * 100 if hasattr(song_obj, 'volume') else 70
+                }
+                logger.info(f"Emitting current song: {current_song_data['title']}")
+            
+            data['current_song'] = current_song_data
+            data['is_playing'] = is_playing
+            data['is_paused'] = is_paused
+            
+        elif event == 'queue_update' and 'queue' not in data:
+            # Get queue with more details
+            queue_data = []
+            if guild_id in queues:
+                for url in queues[guild_id]:
+                    queue_data.append({
+                        'url': url,
+                        'thumbnail': get_thumbnail_url(url),
+                        'title': url  # For now, just use URL as title
+                    })
+            elif int(guild_id) in queues:
+                for url in queues[int(guild_id)]:
+                    queue_data.append({
+                        'url': url,
+                        'thumbnail': get_thumbnail_url(url),
+                        'title': url  # For now, just use URL as title
+                    })
+                    
+            data['queue'] = queue_data
+            data['queue_length'] = len(queue_data)
+            
+        # Log the data being sent (but truncate large fields)
+        log_data = data.copy()
+        if 'queue' in log_data and log_data['queue']:
+            log_data['queue'] = f"[{len(log_data['queue'])} items]"
+        if 'current_song' in log_data and log_data['current_song']:
+            log_data['current_song'] = {
+                'title': log_data['current_song'].get('title', 'Unknown'),
+                'url': log_data['current_song'].get('url', 'None')
+            }
+        logger.info(f"Emit data: {log_data}")
+        
+        # Keep track of successful emissions
+        success_count = 0
+        error_count = 0    
+            
+        for client_sid in connected_clients[guild_id]:
+            try:
+                socketio.emit(event, data, room=client_sid)
+                success_count += 1
+            except Exception as e:
+                error_count += 1
+                logger.error(f"Error emitting {event} to client {client_sid}: {e}")
+        
+        logger.info(f"Emit summary: {success_count} successful, {error_count} failed")
+    else:
+        logger.info(f"No clients connected for guild {guild_id}, skipping {event} event")
+
+# Run the bot in a separate thread
+def run_bot():
+    """Run the Discord bot"""
+    logger.info("Starting Discord bot")
+    bot.run(BOT_TOKEN)
+
+# Main entry point
+if __name__ == "__main__":
+    # Check if we should run in API mode or standalone bot mode
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "--with-api":
+        # Start the bot in a separate thread
+        bot_thread = threading.Thread(target=run_bot)
+        bot_thread.daemon = True
+        bot_thread.start()
+        
+        # Give the bot time to connect before starting the API
+        time.sleep(5)
+        
+        # Start the API server
+        port = int(os.environ.get("PORT", 5000))
+        logger.info(f"Starting API server on port {port}")
+        logger.info("WebSocket server will be available at ws://localhost:{port}/socket.io/")
+        socketio.run(
+            app, 
+            host='0.0.0.0', 
+            port=port, 
+            debug=False, 
+            allow_unsafe_werkzeug=True, 
+            log_output=True,  # Log Socket.IO server output
+            use_reloader=False  # Don't use reloader with threading
+        )
+    else:
+        # Run in standalone bot mode
+        bot.run(BOT_TOKEN)
+
