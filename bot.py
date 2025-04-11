@@ -1690,8 +1690,52 @@ async def play_from_queue(guild, voice_channel):
     
     # Check if there are songs in the queue
     if guild_id in queues and queues[guild_id]:
-        # Use play_next to start playing from the queue
-        await play_next(fake_ctx)
+        # If we have songs in the queue, try to play them directly
+        next_url = queues[guild_id][0]  # Peek at the first item (don't remove yet)
+        
+        logger.info(f"Found song in queue for guild {guild_id}: {next_url}")
+        
+        try:
+            # If it's a search term and not a URL, we need to find it first
+            if not YTDLSource.is_url(next_url):
+                logger.info(f"Searching for: {next_url} in guild {guild_id}")
+                
+                # Create the player for the search term
+                player = await YTDLSource.from_url(next_url, loop=bot.loop, stream=True)
+                
+                # Add a small delay to ensure buffer is filled
+                await asyncio.sleep(0.5)
+                
+                # Play the song
+                logger.info(f"Playing search result: {player.title} in guild {guild_id}")
+                voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(fake_ctx), bot.loop).result() if e is None else None)
+                
+                # Remove it from the queue now that it's playing
+                queues[guild_id].popleft()
+                
+                # Update current song
+                current_song[guild_id] = player
+                
+                # Emit socket events for new song
+                emit_to_guild(guild_id, 'song_update', {
+                    'guild_id': guild_id,
+                    'current_song': song_to_dict(player),
+                    'action': 'play'
+                })
+                
+                emit_to_guild(guild_id, 'queue_update', {
+                    'guild_id': guild_id,
+                    'queue': queue_to_list(guild_id),
+                    'action': 'update'
+                })
+                
+                return
+        
+            # Otherwise, use play_next to handle URLs and start playing from the queue
+            await play_next(fake_ctx)
+        except Exception as e:
+            logger.error(f"Error playing song in play_from_queue for guild {guild_id}: {e}")
+            logger.error(traceback.format_exc())
     else:
         logger.warning(f"No songs in queue for guild {guild_id} in play_from_queue")
 
