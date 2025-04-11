@@ -1625,7 +1625,17 @@ def stop_playback(guild_id):
 
 def run_async(coro):
     """Run async code in a separate thread through a Future object"""
-    loop = asyncio.get_event_loop()
+    try:
+        # Try to get the bot's event loop
+        loop = bot.loop
+        if not loop or not loop.is_running():
+            # If the bot's loop is not available, try to get the current event loop
+            loop = asyncio.get_event_loop()
+    except RuntimeError:
+        # If there is no event loop in this thread, create a new one
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
     future = asyncio.run_coroutine_threadsafe(coro, loop)
     try:
         return future.result(timeout=60)  # Set a reasonable timeout
@@ -1767,7 +1777,9 @@ def play_song(guild_id):
         # Call the playlist handler async function via the helper
         if voice_client:
             fake_ctx = FakeContext(guild, voice_client)
-            run_async(handle_playlist(fake_ctx, search))
+            # Create a coroutine and run it using run_coroutine_threadsafe directly
+            coro = handle_playlist(fake_ctx, search)
+            asyncio.run_coroutine_threadsafe(coro, bot.loop)
             return jsonify({"success": True, "message": "Processing playlist"})
         else:
             # Need to join a voice channel first
@@ -1829,12 +1841,16 @@ def play_song(guild_id):
         if YTDLSource.is_url(search):
             # Add to queue and start playing with play_from_queue
             queues[guild_id].append(search)
-            run_async(play_from_queue(guild, voice_client.channel))
+            # Create a coroutine and run it using run_coroutine_threadsafe directly
+            coro = play_from_queue(guild, voice_client.channel)
+            asyncio.run_coroutine_threadsafe(coro, bot.loop)
             return jsonify({"success": True, "message": f"Playing URL: {search}"})
         else:
             # It's a search term, queue it and start playing
             queues[guild_id].append(search)
-            run_async(play_from_queue(guild, voice_client.channel))
+            # Create a coroutine and run it using run_coroutine_threadsafe directly
+            coro = play_from_queue(guild, voice_client.channel)
+            asyncio.run_coroutine_threadsafe(coro, bot.loop)
             return jsonify({"success": True, "message": f"Searching for and playing: '{search}'"})
     except Exception as e:
         logger.error(f"Error in play API endpoint: {e}")
