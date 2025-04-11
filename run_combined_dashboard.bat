@@ -6,10 +6,25 @@ title Discord Music Bot Dashboard
 echo ===== Discord Music Bot Dashboard =====
 echo.
 
-:: Set our ports
-SET API_PORT=5000
+:: Read API_PORT and FRONTEND_PORT from .env file if it exists
+SET API_PORT=8000
 SET FRONTEND_PORT=3000
 SET DEBUG=0
+
+:: Try to read from .env file
+if exist ".env" (
+    echo Reading configuration from .env file...
+    for /f "tokens=1,* delims==" %%a in (.env) do (
+        if "%%a"=="API_PORT" (
+            SET API_PORT=%%b
+            echo Using API port from .env: !API_PORT!
+        )
+        if "%%a"=="FRONTEND_PORT" (
+            SET FRONTEND_PORT=%%b
+            echo Using Frontend port from .env: !FRONTEND_PORT!
+        )
+    )
+)
 
 :: Check for debug mode
 if "%1"=="-debug" (
@@ -146,12 +161,14 @@ if not exist node_modules (
     )
 )
 
-:: Create simple .env file for the frontend
-echo REACT_APP_API_URL=http://localhost:%API_PORT% > .env
-echo GENERATE_SOURCEMAP=false >> .env
+:: Create .env file for the frontend based on main .env values
+echo Creating frontend .env file with API_PORT=!API_PORT!
+echo REACT_APP_API_URL=http://localhost:!API_PORT! > dashboard\frontend\.env
+echo GENERATE_SOURCEMAP=false >> dashboard\frontend\.env
 
 :: Start React frontend
-start "Frontend" cmd /k "title Frontend && echo === FRONTEND === && SET PORT=%FRONTEND_PORT% && npm start"
+echo Starting frontend on port !FRONTEND_PORT!...
+start "Frontend" cmd /k "title Frontend && echo === FRONTEND === && SET PORT=!FRONTEND_PORT! && npm start"
 cd ..\..
 
 echo.
