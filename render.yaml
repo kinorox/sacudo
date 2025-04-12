@@ -1,0 +1,25 @@
+services:
+  # Discord Bot and API Service
+  - type: web
+    name: sacudo-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py --with-api
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: API_PORT
+        value: 8000
+    healthCheckPath: /api/debug
+    autoDeploy: true
+
+  # React Dashboard Service
+  - type: web
+    name: sacudo-dashboard
+    runtime: node
+    buildCommand: cd dashboard && npm install && npm run build
+    startCommand: cd dashboard && npm start
+    envVars:
+      - key: REACT_APP_API_URL
+        value: https://sacudo-bot.onrender.com
+    autoDeploy: true 
