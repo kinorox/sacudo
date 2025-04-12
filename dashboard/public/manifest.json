@@ -1,6 +1,6 @@
 {
-  "short_name": "Music Bot",
-  "name": "Discord Music Bot Dashboard",
+  "short_name": "Sacudo",
+  "name": "Sacudo Dashboard",
   "icons": [
     {
       "src": "favicon.ico",
@@ -20,6 +20,6 @@
   ],
   "start_url": ".",
   "display": "standalone",
-  "theme_color": "#5865F2",
-  "background_color": "#36393F"
+  "theme_color": "#000000",
+  "background_color": "#ffffff"
 } 

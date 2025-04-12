@@ -8,6 +8,7 @@ from yt_dlp import YoutubeDL
 from collections import deque
 import re
 import logging
+from logging.handlers import RotatingFileHandler
 import datetime
 import traceback
 import atexit
@@ -17,16 +18,18 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from flask_socketio import SocketIO, join_room, leave_room
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(f"bot_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log", encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
+# Set up logging with rotation
+log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+log_file = "bot.log"
+log_handler = RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=5, encoding='utf-8')  # 5MB per file, keep 5 backup files
+log_handler.setFormatter(log_formatter)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+
 logger = logging.getLogger('music_bot')
+logger.setLevel(logging.INFO)
+logger.addHandler(log_handler)
+logger.addHandler(console_handler)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -1281,7 +1284,7 @@ def ensure_cookies_file():
         return False
 
 # Initialize Flask app
-app = Flask(__name__, static_folder='dashboard/frontend/build')
+app = Flask(__name__, static_folder='dashboard/build')
 CORS(app)
 socketio = SocketIO(
     app, 
@@ -1292,6 +1295,15 @@ socketio = SocketIO(
     ping_interval=25,  # Adjust ping interval
     async_mode='threading'  # Explicitly use threading mode
 )
+
+# Serve React App
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve(path):
+    if path != "" and os.path.exists(app.static_folder + '/' + path):
+        return send_from_directory(app.static_folder, path)
+    else:
+        return send_from_directory(app.static_folder, 'index.html')
 
 # Store connected clients by guild_id
 connected_clients = {}
@@ -2056,15 +2068,6 @@ def clear_queue(guild_id):
 def debug():
     """Debug endpoint to test if API is running"""
     return jsonify({"status": "API is running", "bot": bot.user.name if bot.user else "Bot not connected"})
-
-# Serve React frontend
-@app.route('/', defaults={'path': ''})
-@app.route('/<path:path>')
-def serve(path):
-    if path != "" and os.path.exists(app.static_folder + '/' + path):
-        return send_from_directory(app.static_folder, path)
-    else:
-        return send_from_directory(app.static_folder, 'index.html')
 
 # Socket events
 @socketio.on('connect')

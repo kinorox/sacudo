@@ -48,14 +48,14 @@ Thumbs.db
 cookies.txt
 
 # Dashboard specific
-dashboard/frontend/node_modules/
-dashboard/frontend/.pnp
-dashboard/frontend/.pnp.js
-dashboard/frontend/coverage/
-dashboard/frontend/build/
+dashboard/node_modules/
+dashboard/.pnp
+dashboard/.pnp.js
+dashboard/coverage/
+dashboard/build/
 
 # Testing
-dashboard/frontend/coverage/
+dashboard/coverage/
 
 # Misc
 .env.local
