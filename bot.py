@@ -391,6 +391,30 @@ async def on_ready():
     # Test YouTube connection with various methods
     asyncio.create_task(test_youtube_connection())
 
+# Define this function before it's used in test_youtube_connection
+def is_running_on_render():
+    """Check if the bot is running on Render."""
+    return os.environ.get('RENDER') == 'true' or os.path.exists('/opt/render')
+
+def safe_youtube_options_for_render(options):
+    """Remove Render-incompatible options from YouTube download options."""
+    if not is_running_on_render():
+        return options
+        
+    # Make a copy to avoid modifying the original
+    safe_options = dict(options)
+    
+    # Remove browser cookie options that won't work on Render
+    if 'cookiesfrombrowser' in safe_options:
+        logger.info("Removing cookiesfrombrowser option for Render environment")
+        del safe_options['cookiesfrombrowser']
+        
+    # Always ensure we have a user agent
+    if 'user_agent' not in safe_options:
+        safe_options['user_agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        
+    return safe_options
+
 async def test_youtube_connection():
     """Test if YouTube extraction is working properly and uses the best available method."""
     logger.info("Testing YouTube connection...")
@@ -2586,6 +2610,17 @@ def join_voice_channel(guild_id):
         logger.error(traceback.format_exc())
         return jsonify({"error": f"Error: {str(e)}"}), 500
 
+# Health check endpoint for Render
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint for Render to use."""
+    return jsonify({
+        "status": "healthy",
+        "environment": "render" if is_running_on_render() else "local",
+        "bot_connected": bot.user is not None,
+        "uptime": time.time() - bot.uptime if hasattr(bot, 'uptime') else None
+    })
+
 # Function to run the Discord bot
 def run_bot():
     """Run the Discord bot"""
@@ -2764,39 +2799,4 @@ async def handle_stop_request(ctx):
     })
     
     return "⏹ Stopped playback and cleared the queue."
-
-# Add this before the test_youtube_connection function
-def is_running_on_render():
-    """Check if the bot is running on Render."""
-    return os.environ.get('RENDER') == 'true' or os.path.exists('/opt/render')
-
-def safe_youtube_options_for_render(options):
-    """Remove Render-incompatible options from YouTube download options."""
-    if not is_running_on_render():
-        return options
-        
-    # Make a copy to avoid modifying the original
-    safe_options = dict(options)
-    
-    # Remove browser cookie options that won't work on Render
-    if 'cookiesfrombrowser' in safe_options:
-        logger.info("Removing cookiesfrombrowser option for Render environment")
-        del safe_options['cookiesfrombrowser']
-        
-    # Always ensure we have a user agent
-    if 'user_agent' not in safe_options:
-        safe_options['user_agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-        
-    return safe_options
-
-# Add this with the other API routes
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint for Render to use."""
-    return jsonify({
-        "status": "healthy",
-        "environment": "render" if is_running_on_render() else "local",
-        "bot_connected": bot.user is not None,
-        "uptime": time.time() - bot.uptime if hasattr(bot, 'uptime') else None
-    })
 
