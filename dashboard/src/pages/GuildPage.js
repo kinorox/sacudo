@@ -675,6 +675,52 @@ const GuildPage = () => {
       setLoading(false);
     }
   }, [guildId, navigate]);
+
+  // Move socket event handlers outside useEffect
+  const handleSongUpdate = useCallback((data) => {
+    console.log('Received song_update event:', data);
+    if (data.guild_id === guildId) {
+      console.log('Updating guild info due to song update');
+      
+      setGuildInfo(prevState => {
+        const newState = {
+          ...prevState,
+          current_song: data.current_song,
+          is_playing: data.is_playing,
+          is_paused: data.is_paused
+        };
+        
+        console.log('New state after update:', {
+          current_song: newState.current_song?.title,
+          is_playing: newState.is_playing,
+          is_paused: newState.is_paused
+        });
+        
+        return newState;
+      });
+    }
+  }, [guildId]);
+
+  const handleQueueUpdate = useCallback((data) => {
+    console.log('Received queue_update event:', data);
+    if (data.guild_id === guildId) {
+      console.log('Updating guild info due to queue update');
+      
+      setGuildInfo(prevState => {
+        const newState = {
+          ...prevState,
+          queue: data.queue,
+          queue_length: data.queue_length || (data.queue ? data.queue.length : 0)
+        };
+        
+        console.log('New state after queue update:', {
+          queue_length: newState.queue?.length
+        });
+        
+        return newState;
+      });
+    }
+  }, [guildId]);
   
   useEffect(() => {
     fetchGuildInfo();
@@ -705,85 +751,9 @@ const GuildPage = () => {
       });
     });
     
-    // Listen for updates
-    socketRef.current.on('song_update', (data) => {
-      console.log('Received song_update event:', data);
-      if (data.guild_id === guildId) {
-        console.log('Updating guild info due to song update');
-        console.log('Current song before update:', guildInfo?.current_song?.title);
-        console.log('New song from socket:', data.current_song?.title);
-        
-        // Immediately update the current song data rather than waiting for fetchGuildInfo
-        if (guildInfo) {
-          setGuildInfo(prevState => {
-            const newState = {
-              ...prevState,
-              current_song: data.current_song,
-              is_playing: data.is_playing,
-              is_paused: data.is_paused
-            };
-            
-            // Log here instead of outside to see actual updated values
-            console.log('New state after update:', {
-              current_song: newState.current_song?.title,
-              is_playing: newState.is_playing,
-              is_paused: newState.is_paused
-            });
-            
-            return newState;
-          });
-          
-          // Remove this setTimeout as it's using the old state before React updates
-          // setTimeout(() => {
-          //   console.log('State after song_update:', {
-          //     current_song: guildInfo.current_song?.title,
-          //     is_playing: guildInfo.is_playing,
-          //     is_paused: guildInfo.is_paused
-          //   });
-          // }, 100);
-        }
-        
-        // Remove the fetchGuildInfo call to prevent overwriting the current song data
-        // fetchGuildInfo();
-      }
-    });
-    
-    socketRef.current.on('queue_update', (data) => {
-      console.log('Received queue_update event:', data);
-      if (data.guild_id === guildId) {
-        console.log('Updating guild info due to queue update');
-        console.log('Current queue length before update:', guildInfo?.queue?.length);
-        console.log('New queue length from socket:', data.queue?.length);
-        
-        // Immediately update the queue data rather than waiting for fetchGuildInfo
-        if (guildInfo && data.queue) {
-          setGuildInfo(prevState => {
-            const newState = {
-              ...prevState,
-              queue: data.queue,
-              queue_length: data.queue_length || (data.queue ? data.queue.length : 0)
-            };
-            
-            // Log here instead of outside to see actual updated values
-            console.log('New state after queue update:', {
-              queue_length: newState.queue?.length
-            });
-            
-            return newState;
-          });
-          
-          // Remove this setTimeout as it's using the old state before React updates
-          // setTimeout(() => {
-          //   console.log('State after queue_update:', {
-          //     queue_length: guildInfo.queue?.length
-          //   });
-          // }, 100);
-        }
-        
-        // Remove the fetchGuildInfo call to prevent overwriting the socket data
-        // fetchGuildInfo();
-      }
-    });
+    // Listen for updates using the handlers
+    socketRef.current.on('song_update', handleSongUpdate);
+    socketRef.current.on('queue_update', handleQueueUpdate);
     
     // Set an interval to refresh guild data periodically as a fallback
     const refreshInterval = setInterval(() => {
@@ -799,7 +769,7 @@ const GuildPage = () => {
       }
       clearInterval(refreshInterval);
     };
-  }, [guildId, navigate, fetchGuildInfo]);
+  }, [guildId, navigate, fetchGuildInfo, handleSongUpdate, handleQueueUpdate]);
   
   if (loading) {
     return (
