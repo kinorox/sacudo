@@ -185,10 +185,16 @@ class YTDLSource(discord.PCMVolumeTransformer):
             'noplaylist': True,
         }
         
+        # Check if we're running on Render
+        is_render = os.environ.get('RENDER') == 'true' or os.path.exists('/opt/render')
+        
         # Add the best options we discovered during testing
         if best_youtube_options:
             logger.info(f"Adding best YouTube options: {best_youtube_options}")
-            base_options.update(best_youtube_options)
+            
+            # Use the helper function to get Render-safe options
+            safe_options = safe_youtube_options_for_render(best_youtube_options)
+            base_options.update(safe_options)
         else:
             # Fallback options if we don't have best options yet
             logger.info("Using fallback YouTube options")
@@ -377,6 +383,8 @@ class MusicControls(discord.ui.View):
 @bot.event
 async def on_ready():
     logger.info(f'Logged in as {bot.user}')
+    # Store the bot startup time
+    bot.uptime = time.time()
     ensure_cookies_file()
     logger.info("Checked cookies file")
     
@@ -387,27 +395,48 @@ async def test_youtube_connection():
     """Test if YouTube extraction is working properly and uses the best available method."""
     logger.info("Testing YouTube connection...")
     test_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"  # A popular video that's unlikely to be removed
-    methods = [
-        {"method": "default", "options": {}},
-        {"method": "with_cookies", "options": {"cookies": "cookies.txt"}},
-        {"method": "with_useragent", "options": {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        }},
-        {"method": "with_both", "options": {
-            "cookies": "cookies.txt",
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        }},
-        {"method": "with_cookies_browser", "options": {
-            "cookiesfrombrowser": ('chrome',)
-        }},
-        {"method": "with_all", "options": {
-            "cookies": "cookies.txt",
-            "cookiesfrombrowser": ('chrome',),
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "geo_bypass": True,
-            "geo_bypass_country": "US"
-        }}
-    ]
+    
+    # Check if we're running on Render
+    render_env = is_running_on_render()
+    logger.info(f"Detected environment: {'Render' if render_env else 'Local'}")
+    
+    # Define methods to test based on environment
+    if render_env:
+        # On Render, don't use browser cookie methods which won't work
+        methods = [
+            {"method": "default", "options": {}},
+            {"method": "with_cookies", "options": {"cookies": "cookies.txt"}},
+            {"method": "with_useragent", "options": {
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            }},
+            {"method": "with_both", "options": {
+                "cookies": "cookies.txt",
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            }}
+        ]
+    else:
+        # On local machine, try browser cookies too
+        methods = [
+            {"method": "default", "options": {}},
+            {"method": "with_cookies", "options": {"cookies": "cookies.txt"}},
+            {"method": "with_useragent", "options": {
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            }},
+            {"method": "with_both", "options": {
+                "cookies": "cookies.txt",
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            }},
+            {"method": "with_cookies_browser", "options": {
+                "cookiesfrombrowser": ('chrome',)
+            }},
+            {"method": "with_all", "options": {
+                "cookies": "cookies.txt",
+                "cookiesfrombrowser": ('chrome',),
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "geo_bypass": True,
+                "geo_bypass_country": "US"
+            }}
+        ]
     
     working_methods = []
     
@@ -442,7 +471,12 @@ async def test_youtube_connection():
         logger.info("Successfully tested YouTube extraction methods")
     else:
         logger.error("No working YouTube extraction methods found. Music playback might not work.")
-        best_youtube_options = methods[-1]["options"]  # Use the most comprehensive method as fallback
+        # Use a simple fallback that should work in most cases
+        best_youtube_options = {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "cookies": "cookies.txt"
+        }
+        logger.info(f"Using fallback method with options: {best_youtube_options}")
 
 # Add this above the YouTubeDL class
 best_youtube_options = {}
@@ -650,6 +684,12 @@ async def extract_song_info_for_queue(search, guild_id):
             'skip_download': True,
             'nocheckcertificate': True
         }
+        
+        # Add the best options we've determined through testing
+        if best_youtube_options:
+            # Use the helper function to get Render-safe options
+            safe_options = safe_youtube_options_for_render(best_youtube_options)
+            ydl_opts.update(safe_options)
         
         with YoutubeDL(ydl_opts) as ydl:
             logger.info(f"Extracting info for queue: {search}")
@@ -1119,8 +1159,15 @@ async def handle_playlist(ctx, url):
         'geo_bypass': True,
         'geo_bypass_country': 'US',
         'extractor_args': {'youtube': {'skip': ['dash', 'hls']}},
-        'cookiefile': 'cookies.txt'
+        'cookies': 'cookies.txt'
     }
+    
+    # Use best options we've found through testing
+    if best_youtube_options:
+        # Apply only the options that are safe for Render
+        safe_options = safe_youtube_options_for_render(best_youtube_options)
+        ydl_opts.update(safe_options)
+    
     with YoutubeDL(ydl_opts) as ydl:
         info_dict = ydl.extract_info(url, download=False)
         entries = info_dict['entries']
@@ -2717,4 +2764,39 @@ async def handle_stop_request(ctx):
     })
     
     return "⏹ Stopped playback and cleared the queue."
+
+# Add this before the test_youtube_connection function
+def is_running_on_render():
+    """Check if the bot is running on Render."""
+    return os.environ.get('RENDER') == 'true' or os.path.exists('/opt/render')
+
+def safe_youtube_options_for_render(options):
+    """Remove Render-incompatible options from YouTube download options."""
+    if not is_running_on_render():
+        return options
+        
+    # Make a copy to avoid modifying the original
+    safe_options = dict(options)
+    
+    # Remove browser cookie options that won't work on Render
+    if 'cookiesfrombrowser' in safe_options:
+        logger.info("Removing cookiesfrombrowser option for Render environment")
+        del safe_options['cookiesfrombrowser']
+        
+    # Always ensure we have a user agent
+    if 'user_agent' not in safe_options:
+        safe_options['user_agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        
+    return safe_options
+
+# Add this with the other API routes
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint for Render to use."""
+    return jsonify({
+        "status": "healthy",
+        "environment": "render" if is_running_on_render() else "local",
+        "bot_connected": bot.user is not None,
+        "uptime": time.time() - bot.uptime if hasattr(bot, 'uptime') else None
+    })
 
