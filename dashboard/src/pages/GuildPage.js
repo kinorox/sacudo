@@ -313,10 +313,9 @@ const MusicPlayer = ({ currentSong, guildInfo, refreshData }) => {
 };
 
 // Queue Component
-const QueueList = ({ queue, guildId, refreshData }) => {
+const QueueList = ({ queue, guildId, refreshData, guildInfo }) => {
   const [search, setSearch] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [selectedChannel, setSelectedChannel] = useState('');
   const [showDebug, setShowDebug] = useState(false);
   
   const handleRemoveFromQueue = async (index) => {
@@ -381,11 +380,6 @@ const QueueList = ({ queue, guildId, refreshData }) => {
     try {
       const requestBody = { url: search };
       
-      // If we have a selectedChannel, include it in the request
-      if (selectedChannel) {
-        requestBody.channel_id = selectedChannel;
-      }
-      
       const response = await fetch(`/api/guild/${guildId}/play`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -413,6 +407,19 @@ const QueueList = ({ queue, guildId, refreshData }) => {
   const handleRefresh = () => {
     refreshData();
   };
+  
+  // Monitor changes to current song for debugging
+  useEffect(() => {
+    if (guildInfo?.current_song) {
+      console.log('GUILD INFO UPDATED - Current song:', {
+        title: guildInfo.current_song.title,
+        url: guildInfo.current_song.url,
+        timestamp: new Date().toISOString(),
+        is_playing: guildInfo.is_playing,
+        is_paused: guildInfo.is_paused 
+      });
+    }
+  }, [guildInfo]);
   
   return (
     <div className="bg-discord-dark rounded-lg shadow-md p-4 mt-4">
@@ -794,21 +801,6 @@ const GuildPage = () => {
     };
   }, [guildId, navigate, fetchGuildInfo]);
   
-  // Monitor changes to current song for debugging
-  useEffect(() => {
-    if (guildInfo?.current_song) {
-      console.log('GUILD INFO UPDATED - Current song:', {
-        title: guildInfo.current_song.title,
-        url: guildInfo.current_song.url,
-        timestamp: new Date().toISOString(),
-        is_playing: guildInfo.is_playing,
-        is_paused: guildInfo.is_paused 
-      });
-    } else {
-      console.log('GUILD INFO UPDATED - No current song');
-    }
-  }, [guildInfo?.current_song, guildInfo?.is_playing, guildInfo?.is_paused]);
-  
   if (loading) {
     return (
       <div className="flex justify-center items-center min-h-[calc(100vh-64px)]">
@@ -879,6 +871,7 @@ const GuildPage = () => {
         queue={guildInfo.queue || []} 
         guildId={guildInfo.id} 
         refreshData={fetchGuildInfo}
+        guildInfo={guildInfo}
       />
     </div>
   );
