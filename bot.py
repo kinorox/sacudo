@@ -215,9 +215,15 @@ class YTDLSource(discord.PCMVolumeTransformer):
         if cookies_exists:
             with open(cookies_path_to_use, 'r') as f:
                 content = f.read().strip()
-                if content and not content.startswith("# Netscape HTTP Cookie File"):
-                    base_options['cookiefile'] = cookies_path_to_use
-                    logger.info(f"Using cookies file for authentication: {cookies_path_to_use}")
+                if content and content.startswith("# Netscape HTTP Cookie File"):
+                    # Copy cookies to temp writable file if on Render
+                    if is_render:
+                        writable_cookies_path = copy_cookies_to_temp(cookies_path_to_use)
+                        base_options['cookiefile'] = writable_cookies_path
+                        logger.info(f"Using temp cookies file for authentication: {writable_cookies_path}")
+                    else:
+                        base_options['cookiefile'] = cookies_path_to_use
+                        logger.info(f"Using cookies file for authentication: {cookies_path_to_use}")
                 else:
                     logger.warning(f"Cookies file exists but appears empty or is a template: {cookies_path_to_use}")
         
@@ -446,6 +452,34 @@ def safe_youtube_options_for_render(options):
         safe_options['user_agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
         
     return safe_options
+
+def copy_cookies_to_temp(cookies_path):
+    """Copy cookies from read-only location to a writable temp file.
+    
+    This is needed for Render's read-only filesystem where yt-dlp needs to read the cookies.
+    Returns the temporary file path that should be used instead.
+    """
+    if not is_running_on_render() or not os.path.exists(cookies_path):
+        return cookies_path
+    
+    try:
+        import tempfile
+        
+        # Create a temp file for cookies
+        cookies_temp = tempfile.NamedTemporaryFile(delete=False, suffix='.txt')
+        cookies_temp.close()
+        
+        # Copy from source to temp location
+        with open(cookies_path, 'r') as source:
+            with open(cookies_temp.name, 'w') as dest:
+                dest.write(source.read())
+        
+        logger.info(f"Copied cookies from {cookies_path} to temp file {cookies_temp.name}")
+        return cookies_temp.name
+    except Exception as e:
+        logger.error(f"Error copying cookies to temp file: {e}")
+        logger.error(traceback.format_exc())
+        return cookies_path
 
 async def test_youtube_connection():
     """Test if YouTube extraction is working properly and uses the best available method."""
@@ -762,6 +796,27 @@ async def extract_song_info_for_queue(search, guild_id):
     """Extract song info for a search query to be added to the queue"""
     logger.info(f"Extracting song info for search query in queue: {search}")
     try:
+        # Check for cookies in both standard and Render secrets locations
+        cookies_file = 'cookies.txt'
+        render_secrets_path = '/etc/secrets/cookies.txt'
+        cookies_exists = False
+        cookies_path_to_use = cookies_file
+        
+        # If on Render, prioritize the secrets path
+        if is_running_on_render():
+            if os.path.exists(render_secrets_path):
+                logger.info(f"Using cookies from Render secrets for queue extraction: {render_secrets_path}")
+                cookies_path_to_use = render_secrets_path
+                cookies_exists = True
+            elif os.path.exists(cookies_file):
+                logger.info(f"Using cookies from app directory for queue extraction: {cookies_file}")
+                cookies_exists = True
+        else:
+            # Local environment
+            if os.path.exists(cookies_file):
+                logger.info(f"Using local cookies file for queue extraction: {cookies_file}")
+                cookies_exists = True
+        
         # Create a minimal YDL options set for just getting info
         ydl_opts = {
             'format': 'bestaudio/best',
@@ -772,6 +827,22 @@ async def extract_song_info_for_queue(search, guild_id):
             'skip_download': True,
             'nocheckcertificate': True
         }
+        
+        # Add cookies if available
+        if cookies_exists:
+            with open(cookies_path_to_use, 'r') as f:
+                content = f.read().strip()
+                if content and content.startswith("# Netscape HTTP Cookie File"):
+                    # Copy cookies to temp writable file if on Render
+                    if is_running_on_render():
+                        writable_cookies_path = copy_cookies_to_temp(cookies_path_to_use)
+                        ydl_opts['cookiefile'] = writable_cookies_path
+                        logger.info(f"Using temp cookies file for queue extraction: {writable_cookies_path}")
+                    else:
+                        ydl_opts['cookiefile'] = cookies_path_to_use
+                        logger.info(f"Using cookies file for queue extraction: {cookies_path_to_use}")
+                else:
+                    logger.warning(f"Cookies file exists but appears empty or is a template: {cookies_path_to_use}")
         
         # Add the best options we've determined through testing
         if best_youtube_options:
@@ -1274,8 +1345,14 @@ async def handle_playlist(ctx, url):
     
     # Add cookies if available
     if cookies_exists:
-        ydl_opts['cookiefile'] = cookies_path_to_use
-        logger.info(f"Using cookies file for playlist authentication: {cookies_path_to_use}")
+        # Copy cookies to temp writable file if on Render
+        if is_running_on_render():
+            writable_cookies_path = copy_cookies_to_temp(cookies_path_to_use)
+            ydl_opts['cookiefile'] = writable_cookies_path
+            logger.info(f"Using temp cookies file for playlist authentication: {writable_cookies_path}")
+        else:
+            ydl_opts['cookiefile'] = cookies_path_to_use
+            logger.info(f"Using cookies file for playlist authentication: {cookies_path_to_use}")
     
     # Use best options we've found through testing
     if best_youtube_options:
@@ -3002,9 +3079,15 @@ async def download_audio(url, output_path, cookies_file='cookies.txt'):
         if cookies_exists:
             with open(cookies_path_to_use, 'r') as f:
                 content = f.read().strip()
-                if content and not content.startswith("# Netscape HTTP Cookie File"):
-                    ydl_opts['cookiefile'] = cookies_path_to_use
-                    logger.info(f"Using cookies file for authentication: {cookies_path_to_use}")
+                if content and content.startswith("# Netscape HTTP Cookie File"):
+                    # Copy cookies to temp writable file if on Render
+                    if is_running_on_render():
+                        writable_cookies_path = copy_cookies_to_temp(cookies_path_to_use)
+                        ydl_opts['cookiefile'] = writable_cookies_path
+                        logger.info(f"Using temp cookies file for authentication: {writable_cookies_path}")
+                    else:
+                        ydl_opts['cookiefile'] = cookies_path_to_use
+                        logger.info(f"Using cookies file for authentication: {cookies_path_to_use}")
                 else:
                     logger.warning(f"Cookies file exists but appears empty or is a template: {cookies_path_to_use}")
 
