@@ -186,7 +186,18 @@ class YTDLSource(discord.PCMVolumeTransformer):
         }
         
         # Check if we're running on Render
-        is_render = os.environ.get('RENDER') == 'true' or os.path.exists('/opt/render')
+        is_render = is_running_on_render()
+        
+        # Add cookies if the file exists and has content
+        cookies_file = 'cookies.txt'
+        if os.path.exists(cookies_file):
+            with open(cookies_file, 'r') as f:
+                content = f.read().strip()
+                if content and not content.startswith("# Netscape HTTP Cookie File"):
+                    base_options['cookiefile'] = cookies_file
+                    logger.info("Using cookies file for authentication")
+                else:
+                    logger.warning("Cookies file exists but appears empty or is a template")
         
         # Add the best options we discovered during testing
         if best_youtube_options:
@@ -199,7 +210,6 @@ class YTDLSource(discord.PCMVolumeTransformer):
             # Fallback options if we don't have best options yet
             logger.info("Using fallback YouTube options")
             base_options.update({
-                'cookies': 'cookies.txt',
                 'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             })
         
