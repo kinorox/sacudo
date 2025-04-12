@@ -1420,6 +1420,16 @@ def ensure_cookies_file():
     """Ensure the cookies file exists to prevent errors."""
     cookies_file = 'cookies.txt'
     try:
+        # Check if we're running on Render
+        if is_running_on_render():
+            logger.info("Running on Render - using cookies from secrets")
+            # On Render, we expect the cookies file to be provided via secrets
+            if not os.path.exists(cookies_file):
+                logger.error("Cookies file not found in Render secrets!")
+                return False
+            return True
+
+        # Local development behavior
         if not os.path.exists(cookies_file):
             logger.info(f"Creating empty cookies file: {cookies_file}")
             with open(cookies_file, 'w') as f:
@@ -2799,4 +2809,44 @@ async def handle_stop_request(ctx):
     })
     
     return "⏹ Stopped playback and cleared the queue."
+
+async def download_audio(url, output_path, cookies_file='cookies.txt'):
+    """Download audio from a YouTube URL using yt-dlp."""
+    try:
+        # Check if we're running on Render and cookies file exists
+        if is_running_on_render() and not os.path.exists(cookies_file):
+            logger.error("Cookies file not found in Render secrets!")
+            return False
+
+        # Prepare yt-dlp options
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            'outtmpl': output_path,
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': True,
+        }
+
+        # Add cookies if the file exists and has content
+        if os.path.exists(cookies_file):
+            with open(cookies_file, 'r') as f:
+                content = f.read().strip()
+                if content and not content.startswith("# Netscape HTTP Cookie File"):
+                    ydl_opts['cookiefile'] = cookies_file
+                    logger.info("Using cookies file for authentication")
+                else:
+                    logger.warning("Cookies file exists but appears empty or is a template")
+
+        # Download the audio
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        return True
+    except Exception as e:
+        logger.error(f"Error downloading audio: {e}")
+        return False
 
