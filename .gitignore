@@ -46,6 +46,9 @@ env/
 Thumbs.db
 
 cookies.txt
+bare_cookies.txt
+fixed_cookies.txt
+manual_cookies.txt
 
 # Dashboard specific
 dashboard/node_modules/
