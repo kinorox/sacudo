@@ -173,39 +173,49 @@ class YTDLSource(discord.PCMVolumeTransformer):
             
         logger.info(f"Using format option for URL {url}: {selected_format} (retry: {retry_count})")
         
+        # Base options that work for both search and direct URLs
+        base_options = {
+            'format': selected_format,
+            'quiet': True,
+            'no_warnings': True,
+            'nocheckcertificate': True,
+            'geo_bypass': True,
+            'socket_timeout': 30,
+            'retries': 10,
+            'noplaylist': True,
+        }
+        
+        # Add the best options we discovered during testing
+        if best_youtube_options:
+            logger.info(f"Adding best YouTube options: {best_youtube_options}")
+            base_options.update(best_youtube_options)
+        else:
+            # Fallback options if we don't have best options yet
+            logger.info("Using fallback YouTube options")
+            base_options.update({
+                'cookies': 'cookies.txt',
+                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            })
+        
         # Special handling for search queries vs direct URLs
         if url.startswith('ytsearch:'):
-            logger.info(f"Using simplified options for search query")
+            logger.info(f"Using search query options")
             ydl_opts = {
-                'format': selected_format,
-                'quiet': True,
-                'no_warnings': True,
+                **base_options,
                 'default_search': 'auto',
-                'noplaylist': True,
-                'nocheckcertificate': True,
                 'ignoreerrors': False,  # We want to catch errors for search queries
                 'logtostderr': False,
-                'geo_bypass': True,
                 'source_address': '0.0.0.0',  # Bind to all interfaces
-                'retries': 5
             }
         else:
+            logger.info(f"Using direct URL options")
             ydl_opts = {
-                'format': selected_format,
+                **base_options,
                 'postprocessors': [],        # No post-processing to avoid any delays
                 'extract_flat': 'in_playlist',
-                'quiet': True,
                 'ignoreerrors': True,
-                'retries': 10,
-                'nocheckcertificate': True,
                 'skip_download': True,       # Important: just streaming, not downloading
-                'default_search': 'auto',
-                'cookies': 'cookies.txt',
-                'geo_bypass': True,          # Bypass geo-restrictions
                 'geo_bypass_country': 'US',
-                'socket_timeout': 30,
-                'cookiefile': 'cookies.txt',
-                'noplaylist': True
             }
         
         try:
@@ -369,7 +379,73 @@ async def on_ready():
     logger.info(f'Logged in as {bot.user}')
     ensure_cookies_file()
     logger.info("Checked cookies file")
+    
+    # Test YouTube connection with various methods
+    asyncio.create_task(test_youtube_connection())
 
+async def test_youtube_connection():
+    """Test if YouTube extraction is working properly and uses the best available method."""
+    logger.info("Testing YouTube connection...")
+    test_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"  # A popular video that's unlikely to be removed
+    methods = [
+        {"method": "default", "options": {}},
+        {"method": "with_cookies", "options": {"cookies": "cookies.txt"}},
+        {"method": "with_useragent", "options": {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        }},
+        {"method": "with_both", "options": {
+            "cookies": "cookies.txt",
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        }},
+        {"method": "with_cookies_browser", "options": {
+            "cookiesfrombrowser": ('chrome',)
+        }},
+        {"method": "with_all", "options": {
+            "cookies": "cookies.txt",
+            "cookiesfrombrowser": ('chrome',),
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "geo_bypass": True,
+            "geo_bypass_country": "US"
+        }}
+    ]
+    
+    working_methods = []
+    
+    for method in methods:
+        try:
+            logger.info(f"Testing YouTube extraction with method: {method['method']}")
+            ydl_opts = {
+                "format": "bestaudio",
+                "quiet": True,
+                "extract_flat": True,
+                "skip_download": True,
+                **method["options"]
+            }
+            
+            with YoutubeDL(ydl_opts) as ydl:
+                info = await bot.loop.run_in_executor(None, lambda: ydl.extract_info(test_url, download=False))
+                
+                if info and 'title' in info:
+                    logger.info(f"✅ Method {method['method']} works! Title: {info['title']}")
+                    working_methods.append(method)
+                else:
+                    logger.warning(f"❌ Method {method['method']} didn't extract proper info")
+        except Exception as e:
+            logger.error(f"❌ Method {method['method']} failed with error: {str(e)}")
+    
+    if working_methods:
+        best_method = working_methods[0]
+        logger.info(f"Best working method: {best_method['method']} with options: {best_method['options']}")
+        # Store the best method options globally
+        global best_youtube_options
+        best_youtube_options = best_method["options"]
+        logger.info("Successfully tested YouTube extraction methods")
+    else:
+        logger.error("No working YouTube extraction methods found. Music playback might not work.")
+        best_youtube_options = methods[-1]["options"]  # Use the most comprehensive method as fallback
+
+# Add this above the YouTubeDL class
+best_youtube_options = {}
 
 @bot.command()
 async def join(ctx):
@@ -1276,11 +1352,48 @@ def ensure_cookies_file():
         if not os.path.exists(cookies_file):
             logger.info(f"Creating empty cookies file: {cookies_file}")
             with open(cookies_file, 'w') as f:
-                # Write an empty cookies file
+                # Write a proper cookies file template
                 f.write("# Netscape HTTP Cookie File\n")
+                f.write("# This file is intended to be used with yt-dlp / youtube-dl\n")
+                f.write("# This file makes it more likely that YouTube will treat the request as coming from a real browser\n\n")
+                f.write(".youtube.com\tTRUE\t/\tTRUE\t0\tCONSENT\tYES+cb\n")
+                f.write(".youtube.com\tTRUE\t/\tTRUE\t0\tVISITOR_INFO1_LIVE\tRandomValueHere\n")
+                f.write(".youtube.com\tTRUE\t/\tTRUE\t0\tYSC\tRandomValueHere\n")
+                f.write(".youtube.com\tTRUE\t/\tTRUE\t0\tGPS\t1\n")
+                f.write(".google.com\tTRUE\t/\tTRUE\t0\tNID\tRandomValueHere\n")
+                f.write(".google.com\tTRUE\t/\tTRUE\t0\tCONSENT\tYES+cb\n\n")
+                f.write("# For better results, please login to YouTube in your browser and extract real cookies\n")
+            logger.info(f"Created cookies file template at: {cookies_file}")
+        else:
+            # Check if the file has content
+            with open(cookies_file, 'r') as f:
+                content = f.read().strip()
+                if not content or content == "# Netscape HTTP Cookie File":
+                    logger.warning(f"Cookies file exists but appears empty. Creating template.")
+                    ensure_cookies_file_has_content(cookies_file)
         return True
     except Exception as e:
-        logger.error(f"Error creating cookies file: {e}")
+        logger.error(f"Error managing cookies file: {e}")
+        return False
+
+def ensure_cookies_file_has_content(cookies_file):
+    """Ensure the cookies file has some basic content to work with."""
+    try:
+        with open(cookies_file, 'w') as f:
+            f.write("# Netscape HTTP Cookie File\n")
+            f.write("# This file is intended to be used with yt-dlp / youtube-dl\n")
+            f.write("# This file makes it more likely that YouTube will treat the request as coming from a real browser\n\n")
+            f.write(".youtube.com\tTRUE\t/\tTRUE\t0\tCONSENT\tYES+cb\n")
+            f.write(".youtube.com\tTRUE\t/\tTRUE\t0\tVISITOR_INFO1_LIVE\tRandomValueHere\n")
+            f.write(".youtube.com\tTRUE\t/\tTRUE\t0\tYSC\tRandomValueHere\n")
+            f.write(".youtube.com\tTRUE\t/\tTRUE\t0\tGPS\t1\n")
+            f.write(".google.com\tTRUE\t/\tTRUE\t0\tNID\tRandomValueHere\n")
+            f.write(".google.com\tTRUE\t/\tTRUE\t0\tCONSENT\tYES+cb\n\n")
+            f.write("# For better results, please login to YouTube in your browser and extract real cookies\n")
+        logger.info(f"Updated cookies file with template content: {cookies_file}")
+        return True
+    except Exception as e:
+        logger.error(f"Error updating cookies file: {e}")
         return False
 
 # Initialize Flask app
