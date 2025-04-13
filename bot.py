@@ -220,6 +220,8 @@ class YTDLSource(discord.PCMVolumeTransformer):
                     if is_render:
                         writable_cookies_path = copy_cookies_to_temp(cookies_path_to_use)
                         base_options['cookiefile'] = writable_cookies_path
+                        # Add option to prevent trying to save cookies back to file
+                        base_options['nooverwrites'] = True
                         logger.info(f"Using temp cookies file for authentication: {writable_cookies_path}")
                     else:
                         base_options['cookiefile'] = cookies_path_to_use
@@ -465,8 +467,9 @@ def copy_cookies_to_temp(cookies_path):
     try:
         import tempfile
         
-        # Create a temp file for cookies
-        cookies_temp = tempfile.NamedTemporaryFile(delete=False, suffix='.txt')
+        # Create a temp file for cookies in a definitely writable location
+        temp_dir = '/tmp' if os.path.exists('/tmp') else None
+        cookies_temp = tempfile.NamedTemporaryFile(delete=False, suffix='.txt', dir=temp_dir)
         cookies_temp.close()
         
         # Copy from source to temp location
@@ -567,6 +570,11 @@ async def test_youtube_connection():
                 "skip_download": True,
                 **method["options"]
             }
+            
+            # Add nooverwrites option when on Render to prevent saving cookies
+            if is_running_on_render() and 'cookiefile' in method['options']:
+                ydl_opts['nooverwrites'] = True
+                logger.info(f"Added nooverwrites option for method {method['method']} on Render")
             
             with YoutubeDL(ydl_opts) as ydl:
                 info = await bot.loop.run_in_executor(None, lambda: ydl.extract_info(test_url, download=False))
@@ -837,6 +845,8 @@ async def extract_song_info_for_queue(search, guild_id):
                     if is_running_on_render():
                         writable_cookies_path = copy_cookies_to_temp(cookies_path_to_use)
                         ydl_opts['cookiefile'] = writable_cookies_path
+                        # Add option to prevent trying to save cookies back to file
+                        ydl_opts['nooverwrites'] = True
                         logger.info(f"Using temp cookies file for queue extraction: {writable_cookies_path}")
                     else:
                         ydl_opts['cookiefile'] = cookies_path_to_use
@@ -1349,6 +1359,8 @@ async def handle_playlist(ctx, url):
         if is_running_on_render():
             writable_cookies_path = copy_cookies_to_temp(cookies_path_to_use)
             ydl_opts['cookiefile'] = writable_cookies_path
+            # Add option to prevent trying to save cookies back to file
+            ydl_opts['nooverwrites'] = True
             logger.info(f"Using temp cookies file for playlist authentication: {writable_cookies_path}")
         else:
             ydl_opts['cookiefile'] = cookies_path_to_use
@@ -3084,6 +3096,8 @@ async def download_audio(url, output_path, cookies_file='cookies.txt'):
                     if is_running_on_render():
                         writable_cookies_path = copy_cookies_to_temp(cookies_path_to_use)
                         ydl_opts['cookiefile'] = writable_cookies_path
+                        # Add option to prevent trying to save cookies back to file
+                        ydl_opts['nooverwrites'] = True
                         logger.info(f"Using temp cookies file for authentication: {writable_cookies_path}")
                     else:
                         ydl_opts['cookiefile'] = cookies_path_to_use
