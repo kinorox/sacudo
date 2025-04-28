@@ -18,6 +18,9 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from flask_socketio import SocketIO, join_room, leave_room
 
+import aiohttp
+import uuid
+
 # Set up logging with rotation
 log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 log_file = "bot.log"
@@ -318,6 +321,216 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.cleanup()
 
 
+# 🎵 Handler functions for player controls 🎵
+async def handle_skip_request(ctx):
+    """Core functionality for skipping playback, used by both bot commands and API"""
+    guild_id = ctx.guild.id
+    guild_id_str = str(guild_id)
+    logger.info(f"Skip functionality called for guild {guild_id_str}")
+    
+    if not ctx.voice_client:
+        logger.warning(f"Skip called but bot not connected to voice in guild {guild_id_str}")
+        return "Error: I'm not connected to a voice channel."
+    
+    if not ctx.voice_client.is_playing() and not ctx.voice_client.is_paused():
+        logger.warning(f"Skip called but nothing is playing in guild {guild_id_str}")
+        return "Error: Nothing is playing right now."
+    
+    # Store information about the current song before skipping
+    current_song_info = None
+    if guild_id_str in current_song and current_song[guild_id_str]:
+        current_song_info = {
+            'title': current_song[guild_id_str].title if hasattr(current_song[guild_id_str], 'title') else "Unknown"
+        }
+    elif guild_id in current_song and current_song[guild_id]:
+        current_song_info = {
+            'title': current_song[guild_id].title if hasattr(current_song[guild_id], 'title') else "Unknown"
+        }
+        # Move to string key for consistency
+        current_song[guild_id_str] = current_song[guild_id]
+        del current_song[guild_id]
+    
+    # Fix the queue to remove duplicates before checking if we have a next song
+    logger.info(f"Fixing queue in handle_skip_request for guild {guild_id_str}")
+    await fix_queue(guild_id)
+    
+    # Check if we have a next song to play
+    has_next_song = False
+    next_song_title = "Unknown"
+    
+    # First check preloaded song
+    if guild_id in preloaded_songs and preloaded_songs[guild_id]:
+        has_next_song = True
+        next_song_title = preloaded_songs[guild_id].title if hasattr(preloaded_songs[guild_id], 'title') else "Unknown"
+    # Then check queue
+    elif guild_id in queues and queues[guild_id]:
+        has_next_song = True
+        # Try to get info about the next song from cache
+        next_url = queues[guild_id][0]
+        if next_url in song_cache and 'title' in song_cache[next_url]:
+            next_song_title = song_cache[next_url]['title']
+        else:
+            next_song_title = "Next song in queue"
+            logger.info(f"Next song URL: {next_url} (title not in cache)")
+    
+    # Stop current playback - this will trigger play_next which handles playing the next song
+    ctx.voice_client.stop()
+    logger.info(f"Stopped current song for skip in guild {guild_id_str}")
+    
+    # Immediately force a refresh of the queue for the dashboard
+    emit_to_guild(guild_id, 'queue_update', {
+        'guild_id': guild_id_str,
+        'queue': queue_to_list(guild_id),
+        'action': 'skip'
+    })
+    
+    # Give the bot a moment to start playing the next song
+    await asyncio.sleep(0.5)
+    
+    # Do an immediate refresh of the song data as well
+    song_obj = None
+    if guild_id_str in current_song:
+        song_obj = current_song[guild_id_str]
+    elif guild_id in current_song:
+        song_obj = current_song[guild_id]
+        # Move to string key for consistency
+        current_song[guild_id_str] = current_song[guild_id]
+        del current_song[guild_id]
+    
+    emit_to_guild(guild_id, 'song_update', {
+        'guild_id': guild_id_str,
+        'current_song': song_to_dict(song_obj),
+        'action': 'skip'
+    })
+    
+    if has_next_song:
+        return f"⏭ Skipped to next song: {next_song_title}"
+    else:
+        return "⏭ Skipped current song. No more songs in queue."
+
+async def handle_pause_request(ctx):
+    """Core functionality for pausing playback, used by both bot commands and API"""
+    guild_id = ctx.guild.id
+    logger.info(f"Pause functionality called for guild {guild_id}")
+    
+    if not ctx.voice_client:
+        logger.warning(f"Pause called but bot not connected to voice in guild {guild_id}")
+        return "Error: I'm not connected to a voice channel."
+    
+    if not ctx.voice_client.is_playing():
+        logger.warning(f"Pause called but nothing is playing in guild {guild_id}")
+        return "Error: Nothing is playing right now."
+    
+    if ctx.voice_client.is_paused():
+        logger.warning(f"Pause called but song is already paused in guild {guild_id}")
+        return "Error: Song is already paused."
+    
+    ctx.voice_client.pause()
+    logger.info(f"Paused playback in guild {guild_id}")
+    
+    # Emit socket event to update UI
+    emit_to_guild(guild_id, 'song_update', {
+        'guild_id': str(guild_id),
+        'is_paused': True,
+        'action': 'pause'
+    })
+    
+    return "⏸ Song paused."
+
+async def handle_resume_request(ctx):
+    """Core functionality for resuming playback, used by both bot commands and API"""
+    guild_id = ctx.guild.id
+    logger.info(f"Resume functionality called for guild {guild_id}")
+    
+    if not ctx.voice_client:
+        logger.warning(f"Resume called but bot not connected to voice in guild {guild_id}")
+        return "Error: I'm not connected to a voice channel."
+    
+    if not ctx.voice_client.is_paused():
+        logger.warning(f"Resume called but no song is paused in guild {guild_id}")
+        # Check if we're playing something
+        if ctx.voice_client.is_playing():
+            return "Error: Song is already playing."
+        else:
+            # If nothing is playing, try to play the next song
+            logger.info(f"Nothing is playing, attempting to play next song in guild {guild_id}")
+            asyncio.create_task(play_next(ctx))
+            return "▶ No song was paused. Attempting to play next song..."
+    
+    ctx.voice_client.resume()
+    logger.info(f"Resumed playback in guild {guild_id}")
+    
+    # Emit socket event to update UI
+    emit_to_guild(guild_id, 'song_update', {
+        'guild_id': str(guild_id),
+        'is_paused': False,
+        'action': 'resume'
+    })
+    
+    return "▶ Song resumed."
+
+async def handle_stop_request(ctx):
+    """Core functionality for stopping playback, used by both bot commands and API"""
+    guild_id = ctx.guild.id
+    guild_id_str = str(guild_id)
+    logger.info(f"Stop functionality called for guild {guild_id_str}")
+    
+    if not ctx.voice_client:
+        logger.warning(f"Stop called but bot not connected to voice in guild {guild_id_str}")
+        return "Error: I'm not connected to a voice channel."
+    
+    if not ctx.voice_client.is_playing() and not ctx.voice_client.is_paused():
+        logger.warning(f"Stop called but nothing is playing in guild {guild_id_str}")
+        return "Error: Nothing is playing right now."
+    
+    # Stop the current song
+    ctx.voice_client.stop()
+    
+    # Clear the queue and current song
+    if guild_id in queues:
+        queues[guild_id].clear()
+        logger.info(f"Cleared queue for guild {guild_id_str}")
+    
+    if guild_id_str in current_song:
+        current_song[guild_id_str] = None
+        logger.info(f"Cleared current song for guild {guild_id_str}")
+    elif guild_id in current_song:
+        current_song[guild_id] = None
+        # Move to string key for consistency
+        current_song[guild_id_str] = None
+        del current_song[guild_id]
+        logger.info(f"Cleared current song for guild {guild_id_str} (converted from int)")
+    
+    if guild_id in preloaded_songs and preloaded_songs[guild_id]:
+        preloaded_songs[guild_id].cleanup()
+        preloaded_songs[guild_id] = None
+        logger.info(f"Cleared preloaded song for guild {guild_id_str}")
+    
+    # Update the music message if it exists
+    if guild_id in current_song_message and current_song_message[guild_id]:
+        try:
+            embed = discord.Embed(title="⏹ Playback Stopped", description="The queue has been cleared.", color=discord.Color.red())
+            await current_song_message[guild_id].edit(embed=embed, view=None)
+        except discord.NotFound:
+            pass
+    
+    # Emit socket events to update UI
+    emit_to_guild(guild_id, 'song_update', {
+        'guild_id': guild_id_str,
+        'current_song': None,
+        'is_playing': False,
+        'action': 'stop'
+    })
+    
+    emit_to_guild(guild_id, 'queue_update', {
+        'guild_id': guild_id_str,
+        'queue': [],
+        'queue_length': 0,
+        'action': 'clear'
+    })
+    
+    return "⏹ Stopped playback and cleared the queue."
+
 # 🎵 Button Controls View 🎵
 class MusicControls(discord.ui.View):
     def __init__(self, ctx):
@@ -586,24 +799,37 @@ async def fix_queue(guild_id):
     
     # Get the current song URL if there is one
     current_song_url = None
-    if guild_id in current_song and current_song[guild_id]:
+    guild_id_str = str(guild_id)
+    
+    if guild_id_str in current_song and current_song[guild_id_str]:
+        current_song_url = current_song[guild_id_str].url
+        logger.info(f"Current song URL for queue cleaning (string key): {current_song_url}")
+    elif guild_id in current_song and current_song[guild_id]:
         current_song_url = current_song[guild_id].url
-        logger.info(f"Current song URL for queue cleaning: {current_song_url}")
+        logger.info(f"Current song URL for queue cleaning (int key): {current_song_url}")
     
     # Create a new queue with only unique URLs
     new_queue = deque()
     unique_urls = set()
     
-    # Add only unique URLs to the new queue, excluding the currently playing song
-    for url in queues[guild_id]:
-        # Skip URLs that match the currently playing song
-        if current_song_url and url == current_song_url:
-            logger.warning(f"Found currently playing song in queue, removing it: {url}")
+    # Check if the queue is already empty
+    if not queues[guild_id]:
+        logger.info(f"Queue is already empty for guild {guild_id}")
+        return 0
+    
+    # Add only unique URLs to the new queue
+    for i, url in enumerate(queues[guild_id]):
+        # Skip URLs that match the currently playing song, but only if it's not the first item in queue
+        # When skipping, we want to preserve the next song in the queue
+        if current_song_url and url == current_song_url and i > 0:
+            logger.warning(f"Found currently playing song in queue at position {i}, removing it: {url}")
             continue
             
         if url not in unique_urls:
             unique_urls.add(url)
             new_queue.append(url)
+        else:
+            logger.warning(f"Found duplicate URL in queue at position {i}, removing it: {url}")
     
     # Replace the old queue with the new one
     queues[guild_id] = new_queue
@@ -933,15 +1159,17 @@ async def play_next(ctx):
     logger.info(f"Set playing lock for guild {guild_id_str}")
     
     try:
-        # Fix the queue to remove any duplicates
-        logger.info(f"Fixing queue in play_next for guild {guild_id_str}")
-        await fix_queue(guild_id)
-        
         # Store the current song's URL for duplicate check
         current_url = None
         if guild_id_str in current_song and current_song[guild_id_str]:
             current_url = current_song[guild_id_str].url
             logger.info(f"Current song URL for duplicate check: {current_url}")
+            
+        # Now fix the queue to remove any duplicates
+        # We do this after saving the current URL to avoid removing the current song before we can check
+        logger.info(f"Fixing queue in play_next for guild {guild_id_str}")
+        queue_length = await fix_queue(guild_id)
+        logger.info(f"Queue length after fixing: {queue_length}")
             
         # Clear the current song immediately - we'll set it again if we successfully play a new song
         current_song[guild_id_str] = None
@@ -961,10 +1189,20 @@ async def play_next(ctx):
                     # Don't use the preloaded song and fall through to the next section
                 else:
                     logger.info(f"No more songs in queue after skipping duplicate for guild {guild_id_str}")
-                    if guild_id in current_song_message and current_song_message[guild_id_str]:
+                    # Also ensure we're using consistent keys for current_song_message
+                    if guild_id_str in current_song_message and current_song_message[guild_id_str]:
                         try:
                             embed = discord.Embed(title="⏹ No More Songs to Play", description="The queue is empty. Add more songs to continue!", color=discord.Color.red())
                             await current_song_message[guild_id_str].edit(embed=embed, view=None)
+                        except discord.NotFound:
+                            pass
+                    elif guild_id in current_song_message and current_song_message[guild_id]:
+                        try:
+                            embed = discord.Embed(title="⏹ No More Songs to Play", description="The queue is empty. Add more songs to continue!", color=discord.Color.red())
+                            await current_song_message[guild_id].edit(embed=embed, view=None)
+                            # Move to string key for consistency
+                            current_song_message[guild_id_str] = current_song_message[guild_id]
+                            del current_song_message[guild_id]
                         except discord.NotFound:
                             pass
                             
@@ -1032,11 +1270,14 @@ async def play_next(ctx):
                 asyncio.create_task(preload_next_song(ctx))
                 return
         
-        # Check if there are songs in the queue
-        if guild_id in queues and queues[guild_id] and len(queues[guild_id]) > 0:
+        # Check if there are songs in the queue using the string guild ID
+        if guild_id_str in queues and queues[guild_id_str] and len(queues[guild_id_str]) > 0:
             try:
+                # Log the queue before we pop from it
+                logger.info(f"Queue before popleft: {list(queues[guild_id_str])}")
+                
                 # Get the next URL from the queue
-                next_url = queues[guild_id].popleft()
+                next_url = queues[guild_id_str].popleft()
                 logger.info(f"Next song in queue for guild {guild_id_str}: {next_url}")
                 
                 # Check if this is the same as the current song
@@ -1104,8 +1345,8 @@ async def play_next(ctx):
                         pass
                 
                 # Check if there are more songs in the queue
-                if guild_id in queues and queues[guild_id]:
-                    logger.info(f"There are {len(queues[guild_id])} more songs in the queue, trying next one")
+                if guild_id_str in queues and queues[guild_id_str]:
+                    logger.info(f"There are {len(queues[guild_id_str])} more songs in the queue, trying next one")
                     # Extract the error message for a more user-friendly response
                     error_msg = str(e)
                     if "format is not available" in error_msg.lower() or "format" in error_msg.lower():
@@ -1149,10 +1390,20 @@ async def play_next(ctx):
         # and the queue is truly empty
         else:
             logger.info(f"No more songs in queue for guild {guild_id_str}")
-            if guild_id in current_song_message and current_song_message[guild_id_str]:
+            # Check for both string and integer keys for current_song_message
+            if guild_id_str in current_song_message and current_song_message[guild_id_str]:
                 try:
                     embed = discord.Embed(title="⏹ No More Songs to Play", description="The queue is empty. Add more songs to continue!", color=discord.Color.red())
                     await current_song_message[guild_id_str].edit(embed=embed, view=None)
+                except discord.NotFound:
+                    pass
+            elif guild_id in current_song_message and current_song_message[guild_id]:
+                try:
+                    embed = discord.Embed(title="⏹ No More Songs to Play", description="The queue is empty. Add more songs to continue!", color=discord.Color.red())
+                    await current_song_message[guild_id].edit(embed=embed, view=None)
+                    # Move to string key for consistency
+                    current_song_message[guild_id_str] = current_song_message[guild_id]
+                    del current_song_message[guild_id]
                 except discord.NotFound:
                     pass
             
@@ -1172,7 +1423,7 @@ async def play_next(ctx):
         logger.info(f"Released playing lock for guild {guild_id_str}")
         
         # Log final state of current_song
-        if guild_id in current_song:
+        if guild_id_str in current_song:
             if current_song[guild_id_str]:
                 logger.info(f"Final state: current_song[{guild_id_str}] = {current_song[guild_id_str].title if hasattr(current_song[guild_id_str], 'title') else 'Unknown'}")
             else:
@@ -1193,9 +1444,9 @@ async def preload_next_song(ctx):
         return
     
     # Check if there are songs in the queue
-    if guild_id in queues and queues[guild_id] and len(queues[guild_id]) > 0:
+    if guild_id_str in queues and queues[guild_id_str] and len(queues[guild_id_str]) > 0:
         # Get the next URL without removing it from the queue
-        next_url = queues[guild_id][0]
+        next_url = queues[guild_id_str][0]
         
         # Check if this is the currently playing song
         current_song_obj = None
@@ -1210,10 +1461,10 @@ async def preload_next_song(ctx):
         if current_song_obj and current_song_obj.url == next_url:
             logger.warning(f"Next song in queue is the currently playing song, skipping preload for guild {guild_id_str}")
             # Remove the duplicate from the queue
-            queues[guild_id].popleft()
+            queues[guild_id_str].popleft()
             # Try preloading the next song if there is one
-            if queues[guild_id] and len(queues[guild_id]) > 0:
-                next_url = queues[guild_id][0]
+            if queues[guild_id_str] and len(queues[guild_id_str]) > 0:
+                next_url = queues[guild_id_str][0]
             else:
                 logger.info(f"No more songs in queue after removing duplicate for guild {guild_id_str}")
                 return
@@ -1244,6 +1495,8 @@ async def preload_next_song(ctx):
 async def handle_playlist(ctx, url):
     """Handles the playlist and queues each song."""
     logger.info(f"Handling playlist URL: {url}")
+    guild_id = ctx.guild.id
+    guild_id_str = str(guild_id)
     
     # YouTube playlist options
     ydl_opts = {
@@ -1289,73 +1542,85 @@ async def handle_playlist(ctx, url):
     
     with YoutubeDL(ydl_opts) as ydl:
         info_dict = ydl.extract_info(url, download=False)
-        entries = info_dict['entries']
+        entries = info_dict.get('entries')  # Use .get() for safety
         if not entries:
             logger.warning(f"No entries found in playlist: {url}")
+            await ctx.send("❌ No valid songs found in the playlist.")
             return
 
-        if ctx.guild.id not in queues:
-            queues[ctx.guild.id] = deque()
-            logger.info(f"Created new queue for guild {ctx.guild.id}")
+        # Use string guild ID for consistency
+        if guild_id_str not in queues:
+            queues[guild_id_str] = deque()
+            logger.info(f"Created new queue for guild {guild_id_str}")
         
         # Create a set to track unique URLs to prevent duplicates
         unique_urls = set()
+        added_count = 0
         
         # First, add all unique URLs to the queue
         for entry in entries:
-            if 'url' in entry and entry['url'] not in unique_urls:
+            if entry and 'url' in entry and entry['url'] not in unique_urls:
                 unique_urls.add(entry['url'])
-                queues[ctx.guild.id].append(entry['url'])
+                queues[guild_id_str].append(entry['url'])
+                added_count += 1
         
-        logger.info(f"Added {len(unique_urls)} unique songs from playlist to queue for guild {ctx.guild.id}")
+        if added_count == 0:
+            logger.warning(f"No unique songs found to add from playlist {url} for guild {guild_id_str}")
+            await ctx.send("❌ No valid songs found in the playlist.")
+            return
+            
+        logger.info(f"Added {added_count} unique songs from playlist to queue for guild {guild_id_str}")
         
         # Fix the queue to ensure no duplicates
-        logger.info(f"Fixing queue after adding playlist for guild {ctx.guild.id}")
-        await fix_queue(ctx.guild.id)
+        logger.info(f"Fixing queue after adding playlist for guild {guild_id_str}")
+        await fix_queue(guild_id)
         
         # Emit queue update for dashboard
-        emit_to_guild(ctx.guild.id, 'queue_update', {
-            'guild_id': str(ctx.guild.id),
-            'queue': queue_to_list(str(ctx.guild.id)),
+        emit_to_guild(guild_id, 'queue_update', {
+            'guild_id': guild_id_str,
+            'queue': queue_to_list(guild_id_str),
             'action': 'add_playlist'
         })
         
         # If the bot is not already playing, start playing the first song
         if not ctx.voice_client or not ctx.voice_client.is_playing():
-            if queues[ctx.guild.id]:
-                first_url = queues[ctx.guild.id].popleft()
-                logger.info(f"Playing first song from playlist: {first_url} for guild {ctx.guild.id}")
+            # Ensure queue has items before trying to play
+            if queues.get(guild_id_str):
+                first_url = queues[guild_id_str].popleft()
+                logger.info(f"Playing first song from playlist: {first_url} for guild {guild_id_str}")
                 try:
                     player = await YTDLSource.from_url(first_url, loop=bot.loop, stream=True)
                     
                     # Add a small delay to ensure buffer is filled
                     await asyncio.sleep(0.5)
                     
-                    logger.info(f"Playing first song from playlist: {player.title} for guild {ctx.guild.id}")
+                    logger.info(f"Playing first song from playlist: {player.title} for guild {guild_id_str}")
                     ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop).result() if e is None else None)
-                    current_song[ctx.guild.id] = player
+                    current_song[guild_id_str] = player
                     
                     await update_music_message(ctx, player)
-                    await ctx.send(f"🎵 Playing playlist. Added {len(queues[ctx.guild.id])} songs to the queue.")
+                    await ctx.send(f"🎵 Playing playlist. Added {len(queues[guild_id_str])} songs to the queue.")
                     
                     # Emit song update for dashboard
-                    emit_to_guild(ctx.guild.id, 'song_update', {
-                        'guild_id': str(ctx.guild.id),
+                    emit_to_guild(guild_id, 'song_update', {
+                        'guild_id': guild_id_str,
                         'current_song': song_to_dict(player),
                         'action': 'play'
                     })
                     
                 except Exception as e:
-                    logger.error(f"Error playing first song from playlist in guild {ctx.guild.id}: {e}")
+                    logger.error(f"Error playing first song from playlist in guild {guild_id_str}: {e}")
                     logger.error(traceback.format_exc())
                     await ctx.send(f"❌ Error playing the first song from the playlist: {str(e)}")
+                    # Try to play the next song if possible
+                    asyncio.create_task(play_next(ctx))
             else:
-                logger.warning(f"No valid songs found in playlist for guild {ctx.guild.id}")
-                await ctx.send("❌ No valid songs found in the playlist.")
+                logger.warning(f"Queue for guild {guild_id_str} is empty after trying to play the first song.")
+                await ctx.send("❌ Queue is empty after processing the playlist.")
         else:
             # If already playing, just add to queue
-            logger.info(f"Bot already playing, added {len(queues[ctx.guild.id])} songs from playlist to queue for guild {ctx.guild.id}")
-            await ctx.send(f"🎵 Added {len(queues[ctx.guild.id])} songs from the playlist to the queue.")
+            logger.info(f"Bot already playing, added {added_count} songs from playlist to queue for guild {guild_id_str}")
+            await ctx.send(f"🎵 Added {added_count} songs from the playlist to the queue.")
 
 @bot.command()
 async def leave(ctx):
@@ -1901,67 +2166,6 @@ def set_volume(guild_id):
         return jsonify({"success": True, "volume": volume})
     else:
         return jsonify({"error": "Couldn't find the current song"}), 400
-
-async def handle_pause_request(ctx):
-    """Core functionality for pausing playback, used by both bot commands and API"""
-    guild_id = ctx.guild.id
-    logger.info(f"Pause functionality called for guild {guild_id}")
-    
-    if not ctx.voice_client:
-        logger.warning(f"Pause called but bot not connected to voice in guild {guild_id}")
-        return "Error: I'm not connected to a voice channel."
-    
-    if not ctx.voice_client.is_playing():
-        logger.warning(f"Pause called but nothing is playing in guild {guild_id}")
-        return "Error: Nothing is playing right now."
-    
-    if ctx.voice_client.is_paused():
-        logger.warning(f"Pause called but song is already paused in guild {guild_id}")
-        return "Error: Song is already paused."
-    
-    ctx.voice_client.pause()
-    logger.info(f"Paused playback in guild {guild_id}")
-    
-    # Emit socket event to update UI
-    emit_to_guild(guild_id, 'song_update', {
-        'guild_id': str(guild_id),
-        'is_paused': True,
-        'action': 'pause'
-    })
-    
-    return "⏸ Song paused."
-
-async def handle_resume_request(ctx):
-    """Core functionality for resuming playback, used by both bot commands and API"""
-    guild_id = ctx.guild.id
-    logger.info(f"Resume functionality called for guild {guild_id}")
-    
-    if not ctx.voice_client:
-        logger.warning(f"Resume called but bot not connected to voice in guild {guild_id}")
-        return "Error: I'm not connected to a voice channel."
-    
-    if not ctx.voice_client.is_paused():
-        logger.warning(f"Resume called but no song is paused in guild {guild_id}")
-        # Check if we're playing something
-        if ctx.voice_client.is_playing():
-            return "Error: Song is already playing."
-        else:
-            # If nothing is playing, try to play the next song
-            logger.info(f"Nothing is playing, attempting to play next song in guild {guild_id}")
-            asyncio.create_task(play_next(ctx))
-            return "▶ No song was paused. Attempting to play next song..."
-    
-    ctx.voice_client.resume()
-    logger.info(f"Resumed playback in guild {guild_id}")
-    
-    # Emit socket event to update UI
-    emit_to_guild(guild_id, 'song_update', {
-        'guild_id': str(guild_id),
-        'is_paused': False,
-        'action': 'resume'
-    })
-    
-    return "▶ Song resumed."
 
 @bot.command()
 async def pause(ctx):
@@ -2828,147 +3032,6 @@ if __name__ == "__main__":
         # Run in standalone bot mode
         bot.run(BOT_TOKEN)
 
-async def handle_skip_request(ctx):
-    """Core functionality for skipping playback, used by both bot commands and API"""
-    guild_id = ctx.guild.id
-    guild_id_str = str(guild_id)
-    logger.info(f"Skip functionality called for guild {guild_id_str}")
-    
-    if not ctx.voice_client:
-        logger.warning(f"Skip called but bot not connected to voice in guild {guild_id_str}")
-        return "Error: I'm not connected to a voice channel."
-    
-    if not ctx.voice_client.is_playing() and not ctx.voice_client.is_paused():
-        logger.warning(f"Skip called but nothing is playing in guild {guild_id_str}")
-        return "Error: Nothing is playing right now."
-    
-    # Store information about the current song before skipping
-    current_song_info = None
-    if guild_id_str in current_song and current_song[guild_id_str]:
-        current_song_info = {
-            'title': current_song[guild_id_str].title if hasattr(current_song[guild_id_str], 'title') else "Unknown"
-        }
-    elif guild_id in current_song and current_song[guild_id]:
-        current_song_info = {
-            'title': current_song[guild_id].title if hasattr(current_song[guild_id], 'title') else "Unknown"
-        }
-        # Move to string key for consistency
-        current_song[guild_id_str] = current_song[guild_id]
-        del current_song[guild_id]
-    
-    # Check if we have a next song to play
-    has_next_song = False
-    next_song_title = "Unknown"
-    
-    # First check preloaded song
-    if guild_id in preloaded_songs and preloaded_songs[guild_id]:
-        has_next_song = True
-        next_song_title = preloaded_songs[guild_id].title if hasattr(preloaded_songs[guild_id], 'title') else "Unknown"
-    # Then check queue
-    elif guild_id in queues and queues[guild_id]:
-        has_next_song = True
-        # Try to get info about the next song from cache
-        next_url = queues[guild_id][0]
-        if next_url in song_cache and 'title' in song_cache[next_url]:
-            next_song_title = song_cache[next_url]['title']
-    
-    # Stop current playback - this will trigger play_next which handles playing the next song
-    ctx.voice_client.stop()
-    logger.info(f"Stopped current song for skip in guild {guild_id_str}")
-    
-    # Immediately force a refresh of the queue for the dashboard
-    emit_to_guild(guild_id, 'queue_update', {
-        'guild_id': guild_id_str,
-        'queue': queue_to_list(guild_id),
-        'action': 'skip'
-    })
-    
-    # Give the bot a moment to start playing the next song
-    await asyncio.sleep(0.5)
-    
-    # Do an immediate refresh of the song data as well
-    song_obj = None
-    if guild_id_str in current_song:
-        song_obj = current_song[guild_id_str]
-    elif guild_id in current_song:
-        song_obj = current_song[guild_id]
-        # Move to string key for consistency
-        current_song[guild_id_str] = current_song[guild_id]
-        del current_song[guild_id]
-    
-    emit_to_guild(guild_id, 'song_update', {
-        'guild_id': guild_id_str,
-        'current_song': song_to_dict(song_obj),
-        'action': 'skip'
-    })
-    
-    if has_next_song:
-        return f"⏭ Skipped to next song: {next_song_title}"
-    else:
-        return "⏭ Skipped current song. No more songs in queue."
-
-async def handle_stop_request(ctx):
-    """Core functionality for stopping playback, used by both bot commands and API"""
-    guild_id = ctx.guild.id
-    guild_id_str = str(guild_id)
-    logger.info(f"Stop functionality called for guild {guild_id_str}")
-    
-    if not ctx.voice_client:
-        logger.warning(f"Stop called but bot not connected to voice in guild {guild_id_str}")
-        return "Error: I'm not connected to a voice channel."
-    
-    if not ctx.voice_client.is_playing() and not ctx.voice_client.is_paused():
-        logger.warning(f"Stop called but nothing is playing in guild {guild_id_str}")
-        return "Error: Nothing is playing right now."
-    
-    # Stop the current song
-    ctx.voice_client.stop()
-    
-    # Clear the queue and current song
-    if guild_id in queues:
-        queues[guild_id].clear()
-        logger.info(f"Cleared queue for guild {guild_id_str}")
-    
-    if guild_id_str in current_song:
-        current_song[guild_id_str] = None
-        logger.info(f"Cleared current song for guild {guild_id_str}")
-    elif guild_id in current_song:
-        current_song[guild_id] = None
-        # Move to string key for consistency
-        current_song[guild_id_str] = None
-        del current_song[guild_id]
-        logger.info(f"Cleared current song for guild {guild_id_str} (converted from int)")
-    
-    if guild_id in preloaded_songs and preloaded_songs[guild_id]:
-        preloaded_songs[guild_id].cleanup()
-        preloaded_songs[guild_id] = None
-        logger.info(f"Cleared preloaded song for guild {guild_id_str}")
-    
-    # Update the music message if it exists
-    if guild_id in current_song_message and current_song_message[guild_id]:
-        try:
-            embed = discord.Embed(title="⏹ Playback Stopped", description="The queue has been cleared.", color=discord.Color.red())
-            await current_song_message[guild_id].edit(embed=embed, view=None)
-        except discord.NotFound:
-            pass
-    
-    # Emit socket events to update UI
-    emit_to_guild(guild_id, 'song_update', {
-        'guild_id': guild_id_str,
-        'current_song': None,
-        'is_playing': False,
-        'action': 'stop'
-    })
-    
-    emit_to_guild(guild_id, 'queue_update', {
-        'guild_id': guild_id_str,
-        'queue': [],
-        'queue_length': 0,
-        'action': 'clear'
-    })
-    
-    return "⏹ Stopped playback and cleared the queue."
-
 async def download_audio(url, output_path, cookies_file='cookies.txt'):
     """Download audio from a YouTube URL using yt-dlp."""
     try:
@@ -3021,4 +3084,65 @@ async def download_audio(url, output_path, cookies_file='cookies.txt'):
     except Exception as e:
         logger.error(f"Error downloading audio: {e}")
         return False
+
+# ElevenLabs API configuration
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
+
+# New command for text-to-speech using ElevenLabs
+@bot.command()
+async def talk(ctx, *, text: str):
+    """Generate and play TTS from ElevenLabs for the given text."""
+    if not ELEVENLABS_API_KEY:
+        return await ctx.send("❌ ElevenLabs API key not set.")
+    # Ensure bot is in voice channel
+    if not ctx.voice_client:
+        await ctx.invoke(join)
+    voice_client = ctx.voice_client
+    # Pause current playback if any
+    resume_after = False
+    if voice_client.is_playing():
+        voice_client.pause()
+        resume_after = True
+    # Generate TTS
+    temp_filename = f"tts_{uuid.uuid4()}.mp3"
+    api_url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
+    headers = {
+        "Accept": "audio/mpeg",
+        "Content-Type": "application/json",
+        "xi-api-key": ELEVENLABS_API_KEY
+    }
+    payload = {"text": text}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(api_url, headers=headers, json=payload) as resp:
+            if resp.status != 200:
+                err_text = await resp.text()
+                return await ctx.send(f"❌ ElevenLabs TTS error: {resp.status} {err_text}")
+            audio_data = await resp.read()
+    # Save TTS to file
+    with open(temp_filename, "wb") as f:
+        f.write(audio_data)
+    # Play the generated TTS
+    source = discord.FFmpegPCMAudio(
+        temp_filename,
+        before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+        options="-vn"
+    )
+    voice_client.play(source, after=lambda e: _after_tts(e, temp_filename, resume_after, voice_client))
+    await ctx.send(f"🔊 Speaking: \"{text}\"")
+
+# Helper to resume and cleanup after TTS playback
+def _after_tts(error, filename, resume_after, voice_client):
+    if error:
+        logger.error(f"TTS playback error: {error}")
+    try:
+        if resume_after and voice_client:
+            voice_client.resume()
+    except Exception as e:
+        logger.error(f"Error resuming playback after TTS: {e}")
+    try:
+        if os.path.exists(filename):
+            os.remove(filename)
+    except Exception as e:
+        logger.error(f"Error removing TTS file {filename}: {e}")
 
