@@ -849,20 +849,21 @@ async def fix_queue(guild_id):
 async def handle_play_request(ctx, search: str):
     """Core functionality for playing a song, used by both bot commands and API"""
     guild_id = ctx.guild.id
-    logger.info(f"Play functionality called for guild {guild_id} with search: {search}")
+    guild_id_str = str(guild_id)
+    logger.info(f"Play functionality called for guild {guild_id_str} with search: {search}")
     logger.info(f"Current current_song keys before play: {list(current_song.keys())}")
     
-    if guild_id in current_song:
-        logger.info(f"handle_play_request: Guild {guild_id} exists in current_song dictionary before play")
-        if current_song[guild_id]:
-            logger.info(f"handle_play_request: Current song before play for guild {guild_id}: {current_song[guild_id].title if hasattr(current_song[guild_id], 'title') else 'Unknown'}")
+    if guild_id_str in current_song:
+        logger.info(f"handle_play_request: Guild {guild_id_str} exists in current_song dictionary before play")
+        if current_song[guild_id_str]:
+            logger.info(f"handle_play_request: Current song before play for guild {guild_id_str}: {current_song[guild_id_str].title if hasattr(current_song[guild_id_str], 'title') else 'Unknown'}")
         else:
-            logger.info(f"handle_play_request: Current song is None for guild {guild_id} before play")
+            logger.info(f"handle_play_request: Current song is None for guild {guild_id_str} before play")
     else:
-        logger.info(f"handle_play_request: Guild {guild_id} not in current_song dictionary before play")
+        logger.info(f"handle_play_request: Guild {guild_id_str} not in current_song dictionary before play")
     
     if not ctx.voice_client:
-        logger.info(f"Bot not in voice channel, joining for guild {guild_id}")
+        logger.info(f"Bot not in voice channel, joining for guild {guild_id_str}")
         await ctx.invoke(join)
 
     if 'list=' in search:
@@ -870,15 +871,15 @@ async def handle_play_request(ctx, search: str):
         return await handle_playlist(ctx, search)
     else:
         # Fix the queue before adding a new song
-        logger.info(f"Fixing queue before adding new song in guild {guild_id}")
-        await fix_queue(ctx.guild.id)
+        logger.info(f"Fixing queue before adding new song in guild {guild_id_str}")
+        await fix_queue(guild_id)
         
         if ctx.voice_client.is_playing():
             logger.info(f"Bot already playing, adding to queue: {search}")
             # Initialize queue if it doesn't exist
-            if ctx.guild.id not in queues:
-                queues[ctx.guild.id] = deque()
-                logger.info(f"Created new queue for guild {ctx.guild.id}")
+            if guild_id_str not in queues:
+                queues[guild_id_str] = deque()
+                logger.info(f"Created new queue for guild {guild_id_str}")
             
             # Check if it's a search query that's not a URL
             if not YTDLSource.is_url(search):
@@ -887,17 +888,17 @@ async def handle_play_request(ctx, search: str):
                 try:
                     # This will be a background task so we don't block the main thread
                     # Create a task to add song to cache for better title display later
-                    asyncio.create_task(extract_song_info_for_queue(search, ctx.guild.id))
+                    asyncio.create_task(extract_song_info_for_queue(search, guild_id))
                 except Exception as e:
                     logger.error(f"Error extracting info for search: {search} - {str(e)}")
             
             # Add to queue
-            queues[ctx.guild.id].append(search)
+            queues[guild_id_str].append(search)
             
             # Emit queue update for dashboard
-            emit_to_guild(ctx.guild.id, 'queue_update', {
-                'guild_id': str(ctx.guild.id),
-                'queue': queue_to_list(str(ctx.guild.id)),
+            emit_to_guild(guild_id, 'queue_update', {
+                'guild_id': guild_id_str,
+                'queue': queue_to_list(guild_id_str),
                 'action': 'add'
             })
             
@@ -923,25 +924,25 @@ async def handle_play_request(ctx, search: str):
                 ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop).result() if e is None else None)
                 
                 # Set the current song and log it
-                current_song[ctx.guild.id] = player
-                logger.info(f"Set current_song[{ctx.guild.id}] = {player.title}")
+                current_song[guild_id_str] = player
+                logger.info(f"Set current_song[{guild_id_str}] = {player.title}")
                 logger.info(f"Current current_song keys after setting: {list(current_song.keys())}")
                 
                 # Now check if it was set correctly
-                if ctx.guild.id in current_song:
-                    if current_song[ctx.guild.id]:
-                        logger.info(f"Verification: current_song[{ctx.guild.id}] successfully set to {current_song[ctx.guild.id].title if hasattr(current_song[ctx.guild.id], 'title') else 'Unknown'}")
+                if guild_id_str in current_song:
+                    if current_song[guild_id_str]:
+                        logger.info(f"Verification: current_song[{guild_id_str}] successfully set to {current_song[guild_id_str].title if hasattr(current_song[guild_id_str], 'title') else 'Unknown'}")
                     else:
-                        logger.warning(f"Verification failed: current_song[{ctx.guild.id}] is None right after setting it!")
+                        logger.warning(f"Verification failed: current_song[{guild_id_str}] is None right after setting it!")
                 else:
-                    logger.warning(f"Verification failed: guild {ctx.guild.id} not in current_song dictionary right after setting it!")
+                    logger.warning(f"Verification failed: guild {guild_id_str} not in current_song dictionary right after setting it!")
 
                 # Update music message
                 await update_music_message(ctx, player)
                 
                 # Emit song update for dashboard
-                emit_to_guild(ctx.guild.id, 'song_update', {
-                    'guild_id': str(ctx.guild.id),
+                emit_to_guild(guild_id, 'song_update', {
+                    'guild_id': guild_id_str,
                     'current_song': song_to_dict(player),
                     'action': 'play'
                 })
