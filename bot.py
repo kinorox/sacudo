@@ -164,66 +164,22 @@ class YTDLSource(discord.PCMVolumeTransformer):
             # but we can use the cache for displaying metadata
             logger.info(f"Cached URL is not direct. Re-extracting for {url}")
         
-        is_render = is_running_on_render()
-        logger.info(f"Running on Render: {is_render}")
+        # Use simplified options
+        ydl_opts = default_youtube_options.copy()
         
-        # Base options for both search and direct URL
-        base_options = {
-            'format': 'bestaudio/best',
-            'nocheckcertificate': True,
-            'noplaylist': True,
-            'quiet': True,
-            'no_warnings': True,
-            'http_chunk_size': 10485760,  # 10M chunks
-            'retries': 5,
-        }
-            
-        # Check for cookies file in app directory (copied from Render secrets by ensure_cookies_file)
-        cookies_file = 'cookies.txt'
-        cookies_exists = False
-        cookies_path_to_use = cookies_file
-        
-        # Local cookies file should exist if ensure_cookies_file was called
-        if os.path.exists(cookies_file):
-            logger.info(f"Using local cookies file for YouTube: {cookies_file}")
-            cookies_exists = True
-            cookies_path_to_use = cookies_file
-        else:
-            logger.warning("No cookies file found! This may affect YouTube extraction.")
-        
-        # Add cookies if available
-        if cookies_exists:
-            with open(cookies_path_to_use, 'r') as f:
-                content = f.read().strip()
-                if content and content.startswith("# Netscape HTTP Cookie File"):
-                    # Use the local file directly - it's already writable
-                    base_options['cookiefile'] = cookies_path_to_use
-                    # Add option to prevent trying to save cookies back to file
-                    base_options['nooverwrites'] = True
-                    logger.info(f"Using cookies file for authentication: {cookies_path_to_use}")
-                else:
-                    logger.warning(f"Cookies file exists but appears empty or is a template: {cookies_path_to_use}")
-        
-        # If this is a search query rather than direct URL
+        # Add specific options based on URL type
         if url.startswith('ytsearch:'):
             logger.info(f"Using search options")
-            ydl_opts = {
-                **base_options,
+            ydl_opts.update({
                 'default_search': 'auto',
                 'ignoreerrors': False,  # We want to catch errors for search queries
-                'logtostderr': False,
-                'source_address': '0.0.0.0',  # Bind to all interfaces
-            }
+            })
         else:
             logger.info(f"Using direct URL options")
-            ydl_opts = {
-                **base_options,
-                'postprocessors': [],        # No post-processing to avoid any delays
-                'extract_flat': 'in_playlist',
+            ydl_opts.update({
                 'ignoreerrors': True,
-                'skip_download': True,       # Important: just streaming, not downloading
-                'geo_bypass_country': 'US',
-            }
+                'skip_download': True,  # Important: just streaming, not downloading
+            })
         
         try:
             with YoutubeDL(ydl_opts) as ydl:
@@ -483,10 +439,8 @@ async def handle_stop_request(ctx):
         logger.warning(f"Stop called but nothing is playing in guild {guild_id_str}")
         return "Error: Nothing is playing right now."
     
-    # Stop the current song
-    ctx.voice_client.stop()
-    
-    # Clear the queue and current song
+    # Clear the queue and current song BEFORE stopping to prevent race condition
+    # This prevents play_next from trying to play the next song when stop() triggers the after callback
     if guild_id in queues:
         queues[guild_id].clear()
         logger.info(f"Cleared queue for guild {guild_id_str}")
@@ -505,6 +459,9 @@ async def handle_stop_request(ctx):
         preloaded_songs[guild_id].cleanup()
         preloaded_songs[guild_id] = None
         logger.info(f"Cleared preloaded song for guild {guild_id_str}")
+    
+    # Now stop the current song - this will trigger play_next but queue is already empty
+    ctx.voice_client.stop()
     
     # Update the music message if it exists
     if guild_id in current_song_message and current_song_message[guild_id]:
@@ -596,181 +553,16 @@ async def on_ready():
     logger.info(f'Logged in as {bot.user}')
     # Store the bot startup time
     bot.uptime = time.time()
-    ensure_cookies_file()
-    logger.info("Checked cookies file")
-    
-    # Test YouTube connection with various methods
-    asyncio.create_task(test_youtube_connection())
+    logger.info("Bot is ready!")
 
-# Define this function before it's used in test_youtube_connection
-def is_running_on_render():
-    """Check if the bot is running on Render."""
-    return os.environ.get('RENDER') == 'true' or os.path.exists('/opt/render')
-
-def safe_youtube_options_for_render(options):
-    """Remove Render-incompatible options from YouTube download options."""
-    if not is_running_on_render():
-        return options
-        
-    # Make a copy to avoid modifying the original
-    safe_options = dict(options)
-    
-    # Remove browser cookie options that won't work on Render
-    if 'cookiesfrombrowser' in safe_options:
-        logger.info("Removing cookiesfrombrowser option for Render environment")
-        del safe_options['cookiesfrombrowser']
-        
-    # Always ensure we have a user agent
-    if 'user_agent' not in safe_options:
-        safe_options['user_agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-        
-    return safe_options
-
-def copy_cookies_to_temp(cookies_path):
-    """Copy cookies from read-only location to a writable temp file.
-    
-    This is needed for Render's read-only filesystem where yt-dlp needs to read the cookies.
-    Returns the temporary file path that should be used instead.
-    """
-    if not is_running_on_render() or not os.path.exists(cookies_path):
-        return cookies_path
-    
-    try:
-        import tempfile
-        
-        # Create a temp file for cookies in a definitely writable location
-        temp_dir = '/tmp' if os.path.exists('/tmp') else None
-        cookies_temp = tempfile.NamedTemporaryFile(delete=False, suffix='.txt', dir=temp_dir)
-        cookies_temp.close()
-        
-        # Copy from source to temp location
-        with open(cookies_path, 'r') as source:
-            with open(cookies_temp.name, 'w') as dest:
-                dest.write(source.read())
-        
-        logger.info(f"Copied cookies from {cookies_path} to temp file {cookies_temp.name}")
-        return cookies_temp.name
-    except Exception as e:
-        logger.error(f"Error copying cookies to temp file: {e}")
-        logger.error(traceback.format_exc())
-        return cookies_path
-
-async def test_youtube_connection():
-    """Test if YouTube extraction is working properly and uses the best available method."""
-    logger.info("Testing YouTube connection...")
-    test_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"  # A popular video that's unlikely to be removed
-    
-    # Check if we're running on Render
-    render_env = is_running_on_render()
-    logger.info(f"Detected environment: {'Render' if render_env else 'Local'}")
-    
-    # Check for cookies file in app directory
-    cookies_file = 'cookies.txt'
-    cookies_exists = False
-    
-    # Local cookies file should exist if ensure_cookies_file was called
-    if os.path.exists(cookies_file):
-        logger.info(f"Using local cookies file for connection test: {cookies_file}")
-        cookies_exists = True
-    else:
-        logger.warning("No cookies file found for connection test! This may affect YouTube extraction tests.")
-    
-    # Define methods to test based on environment
-    if render_env:
-        # On Render, don't use browser cookie methods which won't work
-        methods = [
-            {"method": "default", "options": {}},
-            {"method": "with_cookies", "options": {"cookiefile": cookies_file}} if cookies_exists else {"method": "default_no_cookies", "options": {}},
-            {"method": "with_useragent", "options": {
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            }},
-            {"method": "with_both", "options": {
-                "cookiefile": cookies_file,
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            }} if cookies_exists else {"method": "with_useragent_only", "options": {
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            }}
-        ]
-    else:
-        # On local machine, try browser cookies too
-        methods = [
-            {"method": "default", "options": {}},
-            {"method": "with_cookies", "options": {"cookiefile": cookies_file}} if cookies_exists else {"method": "default_no_cookies", "options": {}},
-            {"method": "with_useragent", "options": {
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            }},
-            {"method": "with_both", "options": {
-                "cookiefile": cookies_file,
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            }} if cookies_exists else {"method": "with_useragent_only", "options": {
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            }},
-            {"method": "with_cookies_browser", "options": {
-                "cookiesfrombrowser": ('chrome',)
-            }},
-            {"method": "with_all", "options": {
-                "cookiefile": cookies_file if cookies_exists else None,
-                "cookiesfrombrowser": ('chrome',),
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "geo_bypass": True,
-                "geo_bypass_country": "US"
-            }}
-        ]
-    
-    working_methods = []
-    
-    for method in methods:
-        try:
-            logger.info(f"Testing YouTube extraction with method: {method['method']}")
-            ydl_opts = {
-                "format": "bestaudio",
-                "quiet": True,
-                "extract_flat": True,
-                "skip_download": True,
-                **method["options"]
-            }
-            
-            # Add nooverwrites option when on Render to prevent saving cookies
-            if is_running_on_render() and 'cookiefile' in method['options']:
-                ydl_opts['nooverwrites'] = True
-                logger.info(f"Added nooverwrites option for method {method['method']} on Render")
-            
-            with YoutubeDL(ydl_opts) as ydl:
-                info = await bot.loop.run_in_executor(None, lambda: ydl.extract_info(test_url, download=False))
-                
-                if info and 'title' in info:
-                    logger.info(f"✅ Method {method['method']} works! Title: {info['title']}")
-                    working_methods.append(method)
-                else:
-                    logger.warning(f"❌ Method {method['method']} didn't extract proper info")
-        except Exception as e:
-            logger.error(f"❌ Method {method['method']} failed with error: {str(e)}")
-    
-    if working_methods:
-        best_method = working_methods[0]
-        logger.info(f"Best working method: {best_method['method']} with options: {best_method['options']}")
-        # Store the best method options globally
-        global best_youtube_options
-        best_youtube_options = best_method["options"]
-        logger.info("Successfully tested YouTube extraction methods")
-    else:
-        logger.error("No working YouTube extraction methods found. Music playback might not work.")
-        # Use a simple fallback that should work in most cases
-        best_youtube_options = {
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        }
-        
-        # Add cookies if available
-        if cookies_exists:
-            best_youtube_options["cookiefile"] = cookies_file
-            # Add option to prevent saving cookies
-            best_youtube_options["nooverwrites"] = True
-            logger.info(f"Added cookies to fallback method: {cookies_file}")
-            
-        logger.info(f"Using fallback method with options: {best_youtube_options}")
-
-# Add this above the YouTubeDL class
-best_youtube_options = {}
+# Simplified YouTube options
+default_youtube_options = {
+    'format': 'bestaudio/best',
+    'nocheckcertificate': True,
+    'noplaylist': True,
+    'quiet': True,
+    'no_warnings': True,
+}
 
 @bot.command()
 async def join(ctx):
@@ -979,45 +771,12 @@ async def extract_song_info_for_queue(search, guild_id):
     """Extract song info for a search query to be added to the queue"""
     logger.info(f"Extracting song info for search query in queue: {search}")
     try:
-        # Check for cookies file in app directory 
-        cookies_file = 'cookies.txt'
-        cookies_exists = False
-        
-        # Local cookies file should exist if ensure_cookies_file was called
-        if os.path.exists(cookies_file):
-            logger.info(f"Using local cookies file for queue extraction: {cookies_file}")
-            cookies_exists = True
-        else:
-            logger.warning("No cookies file found for queue extraction!")
-        
-        # Create a minimal YDL options set for just getting info
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'quiet': True,
-            'no_warnings': True,
+        # Use simplified options
+        ydl_opts = default_youtube_options.copy()
+        ydl_opts.update({
             'default_search': 'auto',
-            'noplaylist': True,
             'skip_download': True,
-            'nocheckcertificate': True
-        }
-        
-        # Add cookies if available
-        if cookies_exists:
-            with open(cookies_file, 'r') as f:
-                content = f.read().strip()
-                if content and content.startswith("# Netscape HTTP Cookie File"):
-                    ydl_opts['cookiefile'] = cookies_file
-                    # Add option to prevent trying to save cookies back to file
-                    ydl_opts['nooverwrites'] = True
-                    logger.info(f"Using cookies file for queue extraction: {cookies_file}")
-                else:
-                    logger.warning(f"Cookies file exists but appears empty or is a template: {cookies_file}")
-        
-        # Add the best options we've determined through testing
-        if best_youtube_options:
-            # Use the helper function to get Render-safe options
-            safe_options = safe_youtube_options_for_render(best_youtube_options)
-            ydl_opts.update(safe_options)
+        })
         
         with YoutubeDL(ydl_opts) as ydl:
             logger.info(f"Extracting info for queue: {search}")
@@ -1499,129 +1258,135 @@ async def handle_playlist(ctx, url):
     guild_id = ctx.guild.id
     guild_id_str = str(guild_id)
     
-    # YouTube playlist options
+    # Ensure bot is connected to voice channel
+    if not ctx.voice_client:
+        logger.info(f"Bot not in voice channel, joining for playlist in guild {guild_id_str}")
+        await ctx.invoke(join)
+    
+    # Use specific options for playlist extraction
     ydl_opts = {
-        'format': 'bestaudio/best',
-        'extract_flat': 'in_playlist',
         'quiet': True,
+        'no_warnings': True,
+        'extract_flat': 'in_playlist',  # Extract playlist entries without downloading videos
         'ignoreerrors': True,
-        'retries': 5,
         'nocheckcertificate': True,
-        'geo_bypass': True,
-        'geo_bypass_country': 'US',
-        'extractor_args': {'youtube': {'skip': ['dash', 'hls']}},
+        'skip_download': True,
+        # Don't include 'noplaylist' option here since we want to extract playlists
     }
     
-    # Check for cookies file in app directory
-    cookies_file = 'cookies.txt'
-    cookies_exists = False
-    
-    # Local cookies file should exist if ensure_cookies_file was called
-    if os.path.exists(cookies_file):
-        logger.info(f"Using local cookies file for playlist: {cookies_file}")
-        cookies_exists = True
-    else:
-        logger.warning("No cookies file found for playlist extraction!")
-    
-    # Add cookies if available
-    if cookies_exists:
-        with open(cookies_file, 'r') as f:
-            content = f.read().strip()
-            if content and content.startswith("# Netscape HTTP Cookie File"):
-                ydl_opts['cookiefile'] = cookies_file
-                # Add option to prevent trying to save cookies back to file
-                ydl_opts['nooverwrites'] = True
-                logger.info(f"Using cookies file for playlist authentication: {cookies_file}")
-            else:
-                logger.warning(f"Cookies file exists but appears empty or is a template: {cookies_file}")
-    
-    # Use best options we've found through testing
-    if best_youtube_options:
-        # Apply only the options that are safe for Render
-        safe_options = safe_youtube_options_for_render(best_youtube_options)
-        ydl_opts.update(safe_options)
-    
-    with YoutubeDL(ydl_opts) as ydl:
-        info_dict = ydl.extract_info(url, download=False)
-        entries = info_dict.get('entries')  # Use .get() for safety
-        if not entries:
-            logger.warning(f"No entries found in playlist: {url}")
-            await ctx.send("❌ No valid songs found in the playlist.")
-            return
-
-        # Use string guild ID for consistency
-        if guild_id_str not in queues:
-            queues[guild_id_str] = deque()
-            logger.info(f"Created new queue for guild {guild_id_str}")
-        
-        # Create a set to track unique URLs to prevent duplicates
-        unique_urls = set()
-        added_count = 0
-        
-        # First, add all unique URLs to the queue
-        for entry in entries:
-            if entry and 'url' in entry and entry['url'] not in unique_urls:
-                unique_urls.add(entry['url'])
-                queues[guild_id_str].append(entry['url'])
-                added_count += 1
-        
-        if added_count == 0:
-            logger.warning(f"No unique songs found to add from playlist {url} for guild {guild_id_str}")
-            await ctx.send("❌ No valid songs found in the playlist.")
-            return
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            logger.info(f"Extracting playlist info for: {url}")
+            info_dict = ydl.extract_info(url, download=False)
             
-        logger.info(f"Added {added_count} unique songs from playlist to queue for guild {guild_id_str}")
+            logger.info(f"Playlist extraction result: {type(info_dict)}")
+            if info_dict:
+                logger.info(f"Info dict keys: {list(info_dict.keys())}")
+                logger.info(f"Playlist title: {info_dict.get('title', 'Unknown')}")
+                logger.info(f"Has entries: {'entries' in info_dict}")
+                if 'entries' in info_dict:
+                    logger.info(f"Number of entries: {len(info_dict['entries']) if info_dict['entries'] else 0}")
+            
+            entries = info_dict.get('entries') if info_dict else None
+            
+            # Handle case where yt-dlp returns a redirect URL instead of entries
+            if not entries and info_dict and info_dict.get('_type') == 'url':
+                redirect_url = info_dict.get('url')
+                logger.info(f"Got redirect URL, trying to extract: {redirect_url}")
+                if redirect_url and redirect_url != url:
+                    # Try extracting from the redirect URL
+                    info_dict = ydl.extract_info(redirect_url, download=False)
+                    logger.info(f"Redirect extraction result: {type(info_dict)}")
+                    if info_dict:
+                        logger.info(f"Redirect info dict keys: {list(info_dict.keys())}")
+                        entries = info_dict.get('entries')
+                        if entries:
+                            logger.info(f"Found {len(entries)} entries from redirect URL")
+            
+            if not entries:
+                logger.warning(f"No entries found in playlist: {url}")
+                logger.warning(f"Final info_dict: {info_dict}")
+                await ctx.send("❌ No valid songs found in the playlist.")
+                return
+    except Exception as e:
+        logger.error(f"Error extracting playlist info: {e}")
+        logger.error(traceback.format_exc())
+        await ctx.send(f"❌ Error processing playlist: {str(e)}")
+        return
+
+    # Use string guild ID for consistency
+    if guild_id_str not in queues:
+        queues[guild_id_str] = deque()
+        logger.info(f"Created new queue for guild {guild_id_str}")
+    
+    # Create a set to track unique URLs to prevent duplicates
+    unique_urls = set()
+    added_count = 0
+    
+    # First, add all unique URLs to the queue
+    for entry in entries:
+        if entry and 'url' in entry and entry['url'] not in unique_urls:
+            unique_urls.add(entry['url'])
+            queues[guild_id_str].append(entry['url'])
+            added_count += 1
+    
+    if added_count == 0:
+        logger.warning(f"No unique songs found to add from playlist {url} for guild {guild_id_str}")
+        await ctx.send("❌ No valid songs found in the playlist.")
+        return
         
-        # Fix the queue to ensure no duplicates
-        logger.info(f"Fixing queue after adding playlist for guild {guild_id_str}")
-        await fix_queue(guild_id)
-        
-        # Emit queue update for dashboard
-        emit_to_guild(guild_id, 'queue_update', {
-            'guild_id': guild_id_str,
-            'queue': queue_to_list(guild_id_str),
-            'action': 'add_playlist'
-        })
-        
-        # If the bot is not already playing, start playing the first song
-        if not ctx.voice_client or not ctx.voice_client.is_playing():
-            # Ensure queue has items before trying to play
-            if queues.get(guild_id_str):
-                first_url = queues[guild_id_str].popleft()
-                logger.info(f"Playing first song from playlist: {first_url} for guild {guild_id_str}")
-                try:
-                    player = await YTDLSource.from_url(first_url, loop=bot.loop, stream=True)
-                    
-                    # Add a small delay to ensure buffer is filled
-                    await asyncio.sleep(0.5)
-                    
-                    logger.info(f"Playing first song from playlist: {player.title} for guild {guild_id_str}")
-                    ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop).result() if e is None else None)
-                    current_song[guild_id_str] = player
-                    
-                    await update_music_message(ctx, player)
-                    await ctx.send(f"🎵 Playing playlist. Added {len(queues[guild_id_str])} songs to the queue.")
-                    
-                    # Emit song update for dashboard
-                    emit_to_guild(guild_id, 'song_update', {
-                        'guild_id': guild_id_str,
-                        'current_song': song_to_dict(player),
-                        'action': 'play'
-                    })
-                    
-                except Exception as e:
-                    logger.error(f"Error playing first song from playlist in guild {guild_id_str}: {e}")
-                    logger.error(traceback.format_exc())
-                    await ctx.send(f"❌ Error playing the first song from the playlist: {str(e)}")
-                    # Try to play the next song if possible
-                    asyncio.create_task(play_next(ctx))
-            else:
-                logger.warning(f"Queue for guild {guild_id_str} is empty after trying to play the first song.")
-                await ctx.send("❌ Queue is empty after processing the playlist.")
+    logger.info(f"Added {added_count} unique songs from playlist to queue for guild {guild_id_str}")
+    
+    # Fix the queue to ensure no duplicates
+    logger.info(f"Fixing queue after adding playlist for guild {guild_id_str}")
+    await fix_queue(guild_id)
+    
+    # Emit queue update for dashboard
+    emit_to_guild(guild_id, 'queue_update', {
+        'guild_id': guild_id_str,
+        'queue': queue_to_list(guild_id_str),
+        'action': 'add_playlist'
+    })
+    
+    # If the bot is not already playing, start playing the first song
+    if not ctx.voice_client or not ctx.voice_client.is_playing():
+        # Ensure queue has items before trying to play
+        if queues.get(guild_id_str):
+            first_url = queues[guild_id_str].popleft()
+            logger.info(f"Playing first song from playlist: {first_url} for guild {guild_id_str}")
+            try:
+                player = await YTDLSource.from_url(first_url, loop=bot.loop, stream=True)
+                
+                # Add a small delay to ensure buffer is filled
+                await asyncio.sleep(0.5)
+                
+                logger.info(f"Playing first song from playlist: {player.title} for guild {guild_id_str}")
+                ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop).result() if e is None else None)
+                current_song[guild_id_str] = player
+                
+                await update_music_message(ctx, player)
+                await ctx.send(f"🎵 Playing playlist. Added {len(queues[guild_id_str])} songs to the queue.")
+                
+                # Emit song update for dashboard
+                emit_to_guild(guild_id, 'song_update', {
+                    'guild_id': guild_id_str,
+                    'current_song': song_to_dict(player),
+                    'action': 'play'
+                })
+                
+            except Exception as e:
+                logger.error(f"Error playing first song from playlist in guild {guild_id_str}: {e}")
+                logger.error(traceback.format_exc())
+                await ctx.send(f"❌ Error playing the first song from the playlist: {str(e)}")
+                # Try to play the next song if possible
+                asyncio.create_task(play_next(ctx))
         else:
-            # If already playing, just add to queue
-            logger.info(f"Bot already playing, added {added_count} songs from playlist to queue for guild {guild_id_str}")
-            await ctx.send(f"🎵 Added {added_count} songs from the playlist to the queue.")
+            logger.warning(f"Queue for guild {guild_id_str} is empty after trying to play the first song.")
+            await ctx.send("❌ Queue is empty after processing the playlist.")
+    else:
+        # If already playing, just add to queue
+        logger.info(f"Bot already playing, added {added_count} songs from playlist to queue for guild {guild_id_str}")
+        await ctx.send(f"🎵 Added {added_count} songs from the playlist to the queue.")
 
 @bot.command()
 async def leave(ctx):
@@ -1776,131 +1541,7 @@ async def volume(ctx, volume: int):
     else:
         await ctx.send("❌ Couldn't find the current song.")
 
-def fix_cookies_file_format(cookies_path):
-    """Add Netscape header to cookies file if it's missing to make it compatible with yt-dlp."""
-    try:
-        with open(cookies_path, 'r') as f:
-            content = f.read()
-        
-        # Check if the file is missing the Netscape header
-        if not content.startswith("# Netscape HTTP Cookie File"):
-            logger.info(f"Adding Netscape header to cookies file: {cookies_path}")
-            
-            # Create new content with the header
-            new_content = "# Netscape HTTP Cookie File\n# https://curl.se/docs/http-cookies.html\n# This file was generated by yt-dlp\n\n" + content
-            
-            # Write the fixed content back to the file
-            with open(cookies_path, 'w') as f:
-                f.write(new_content)
-            
-            logger.info(f"Fixed cookies file format at: {cookies_path}")
-            return True
-        else:
-            # File already has the correct header
-            return True
-    except Exception as e:
-        logger.error(f"Error fixing cookies file format: {e}")
-        return False
 
-# Create a function to ensure the cookies file exists
-def ensure_cookies_file():
-    """Ensure the cookies file exists to prevent errors."""
-    # Standard path in the app root
-    cookies_file = 'cookies.txt'
-    # Render secrets path
-    render_secrets_path = '/etc/secrets/cookies.txt'
-    
-    try:
-        # Check if we're running on Render
-        if is_running_on_render():
-            logger.info("Running on Render - checking for cookies in secrets directory")
-            
-            # First check if the file exists in the Render secrets directory
-            if os.path.exists(render_secrets_path):
-                logger.info(f"Found cookies.txt in Render secrets directory: {render_secrets_path}")
-                
-                # Always copy from secrets to a local writable file
-                try:
-                    with open(render_secrets_path, 'r') as source:
-                        content = source.read()
-                    
-                    # Write to the local app directory (which is writable)
-                    with open(cookies_file, 'w') as dest:
-                        dest.write(content)
-                    logger.info(f"Copied cookies from Render secrets to local writable file: {cookies_file}")
-                    
-                    # Fix the format of the cookies file
-                    fix_cookies_file_format(cookies_file)
-                    return True
-                except Exception as e:
-                    logger.error(f"Error copying cookies from secrets: {e}")
-                    logger.error(traceback.format_exc())
-                    # Try to create a template file as fallback
-                    ensure_cookies_file_has_content(cookies_file)
-                    return True
-            else:
-                # On Render but cookies file not found in secrets
-                logger.error("Cookies file not found in Render secrets directory! YouTube content may not play correctly.")
-                logger.info("Please add cookies.txt to your Render secrets with the correct Netscape format.")
-                
-                # Check if we have a cookies file in the regular path as a fallback
-                if os.path.exists(cookies_file):
-                    logger.info(f"Found cookies.txt in app directory as fallback: {cookies_file}")
-                    # Fix the format if needed
-                    fix_cookies_file_format(cookies_file)
-                    return True
-                else:
-                    # Create a template file
-                    ensure_cookies_file_has_content(cookies_file)
-                    return True
-
-        # Local development behavior
-        if not os.path.exists(cookies_file):
-            logger.info(f"Creating empty cookies file: {cookies_file}")
-            with open(cookies_file, 'w') as f:
-                # Write a proper cookies file template
-                f.write("# Netscape HTTP Cookie File\n")
-                f.write("# This file is intended to be used with yt-dlp / youtube-dl\n")
-                f.write("# This file makes it more likely that YouTube will treat the request as coming from a real browser\n\n")
-                f.write(".youtube.com\tTRUE\t/\tTRUE\t0\tCONSENT\tYES+cb\n")
-                f.write(".youtube.com\tTRUE\t/\tTRUE\t0\tVISITOR_INFO1_LIVE\tRandomValueHere\n")
-                f.write(".youtube.com\tTRUE\t/\tTRUE\t0\tYSC\tRandomValueHere\n")
-                f.write(".youtube.com\tTRUE\t/\tTRUE\t0\tGPS\t1\n")
-                f.write(".google.com\tTRUE\t/\tTRUE\t0\tNID\tRandomValueHere\n")
-                f.write(".google.com\tTRUE\t/\tTRUE\t0\tCONSENT\tYES+cb\n\n")
-                f.write("# For better results, please login to YouTube in your browser and extract real cookies\n")
-            logger.info(f"Created cookies file template at: {cookies_file}")
-        else:
-            # Check if the file has content
-            with open(cookies_file, 'r') as f:
-                content = f.read().strip()
-                if not content or content == "# Netscape HTTP Cookie File":
-                    logger.warning(f"Cookies file exists but appears empty. Creating template.")
-                    ensure_cookies_file_has_content(cookies_file)
-        return True
-    except Exception as e:
-        logger.error(f"Error managing cookies file: {e}")
-        return False
-
-def ensure_cookies_file_has_content(cookies_file):
-    """Ensure the cookies file has some basic content to work with."""
-    try:
-        with open(cookies_file, 'w') as f:
-            f.write("# Netscape HTTP Cookie File\n")
-            f.write("# This file is intended to be used with yt-dlp / youtube-dl\n")
-            f.write("# This file makes it more likely that YouTube will treat the request as coming from a real browser\n\n")
-            f.write(".youtube.com\tTRUE\t/\tTRUE\t0\tCONSENT\tYES+cb\n")
-            f.write(".youtube.com\tTRUE\t/\tTRUE\t0\tVISITOR_INFO1_LIVE\tRandomValueHere\n")
-            f.write(".youtube.com\tTRUE\t/\tTRUE\t0\tYSC\tRandomValueHere\n")
-            f.write(".youtube.com\tTRUE\t/\tTRUE\t0\tGPS\t1\n")
-            f.write(".google.com\tTRUE\t/\tTRUE\t0\tNID\tRandomValueHere\n")
-            f.write(".google.com\tTRUE\t/\tTRUE\t0\tCONSENT\tYES+cb\n\n")
-            f.write("# For better results, please login to YouTube in your browser and extract real cookies\n")
-        logger.info(f"Updated cookies file with template content: {cookies_file}")
-        return True
-    except Exception as e:
-        logger.error(f"Error updating cookies file: {e}")
-        return False
 
 # Initialize Flask app
 app = Flask(__name__, static_folder='dashboard/build')
@@ -2990,7 +2631,6 @@ def health_check():
     """Health check endpoint for Render to use."""
     return jsonify({
         "status": "healthy",
-        "environment": "render" if is_running_on_render() else "local",
         "bot_connected": bot.user is not None,
         "uptime": time.time() - bot.uptime if hasattr(bot, 'uptime') else None
     })
@@ -3033,50 +2673,19 @@ if __name__ == "__main__":
         # Run in standalone bot mode
         bot.run(BOT_TOKEN)
 
-async def download_audio(url, output_path, cookies_file='cookies.txt'):
+async def download_audio(url, output_path):
     """Download audio from a YouTube URL using yt-dlp."""
     try:
-        # Check for cookies file in app directory
-        cookies_exists = False
-        
-        # Local cookies file should exist if ensure_cookies_file was called
-        if os.path.exists(cookies_file):
-            logger.info(f"Using local cookies file for download: {cookies_file}")
-            cookies_exists = True
-        else:
-            logger.error("No cookies file found for download! This may affect YouTube extraction.")
-
-        # Prepare yt-dlp options
-        ydl_opts = {
-            'format': 'bestaudio/best',
+        # Use simplified options for download
+        ydl_opts = default_youtube_options.copy()
+        ydl_opts.update({
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
                 'preferredquality': '192',
             }],
             'outtmpl': output_path,
-            'quiet': True,
-            'no_warnings': True,
-            'extract_flat': True,
-        }
-
-        # Add cookies if available
-        if cookies_exists:
-            with open(cookies_file, 'r') as f:
-                content = f.read().strip()
-                if content and content.startswith("# Netscape HTTP Cookie File"):
-                    ydl_opts['cookiefile'] = cookies_file
-                    # Add option to prevent trying to save cookies back to file
-                    ydl_opts['nooverwrites'] = True
-                    logger.info(f"Using cookies file for authentication: {cookies_file}")
-                else:
-                    logger.warning(f"Cookies file exists but appears empty or is a template: {cookies_file}")
-
-        # Use best options we've found through testing if available
-        if best_youtube_options:
-            # Apply only the options that are safe for Render
-            safe_options = safe_youtube_options_for_render(best_youtube_options)
-            ydl_opts.update(safe_options)
+        })
 
         # Download the audio
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
