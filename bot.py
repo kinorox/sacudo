@@ -578,20 +578,26 @@ async def join(ctx):
 
 async def fix_queue(guild_id):
     """Fixes the queue by removing duplicates and ensuring proper order."""
-    logger.info(f"Fixing queue for guild {guild_id}")
+    guild_id_str = str(guild_id)
+    logger.info(f"Fixing queue for guild {guild_id} (string: {guild_id_str})")
     
-    if guild_id not in queues:
-        logger.info(f"Creating new queue for guild {guild_id}")
-        queues[guild_id] = deque()
+    # Check for queue under both string and integer keys, normalize to string
+    if guild_id_str not in queues and guild_id in queues:
+        logger.info(f"Moving queue from integer key {guild_id} to string key {guild_id_str}")
+        queues[guild_id_str] = queues[guild_id]
+        del queues[guild_id]
+    
+    if guild_id_str not in queues:
+        logger.info(f"Creating new queue for guild {guild_id_str}")
+        queues[guild_id_str] = deque()
         return 0
     
     # Log the original queue
-    original_queue = list(queues[guild_id])
-    logger.info(f"Original queue for guild {guild_id}: {original_queue}")
+    original_queue = list(queues[guild_id_str])
+    logger.info(f"Original queue for guild {guild_id_str}: {original_queue}")
     
     # Get the current song URL if there is one
     current_song_url = None
-    guild_id_str = str(guild_id)
     
     if guild_id_str in current_song and current_song[guild_id_str]:
         current_song_url = current_song[guild_id_str].url
@@ -605,12 +611,12 @@ async def fix_queue(guild_id):
     unique_urls = set()
     
     # Check if the queue is already empty
-    if not queues[guild_id]:
-        logger.info(f"Queue is already empty for guild {guild_id}")
+    if not queues[guild_id_str]:
+        logger.info(f"Queue is already empty for guild {guild_id_str}")
         return 0
     
     # Add only unique URLs to the new queue
-    for i, url in enumerate(queues[guild_id]):
+    for i, url in enumerate(queues[guild_id_str]):
         # Skip URLs that match the currently playing song, but only if it's not the first item in queue
         # When skipping, we want to preserve the next song in the queue
         if current_song_url and url == current_song_url and i > 0:
@@ -624,18 +630,18 @@ async def fix_queue(guild_id):
             logger.warning(f"Found duplicate URL in queue at position {i}, removing it: {url}")
     
     # Replace the old queue with the new one
-    queues[guild_id] = new_queue
+    queues[guild_id_str] = new_queue
     
     # Log the new queue
     new_queue_list = list(new_queue)
-    logger.info(f"New queue for guild {guild_id}: {new_queue_list}")
+    logger.info(f"New queue for guild {guild_id_str}: {new_queue_list}")
     
     # Log removed duplicates
     removed_count = len(original_queue) - len(new_queue_list)
     if removed_count > 0:
-        logger.info(f"Removed {removed_count} duplicate songs from queue in guild {guild_id}")
+        logger.info(f"Removed {removed_count} duplicate songs from queue in guild {guild_id_str}")
     
-    return len(queues[guild_id])
+    return len(queues[guild_id_str])
 
 
 async def handle_play_request(ctx, search: str):
@@ -1030,8 +1036,19 @@ async def play_next(ctx):
                 asyncio.create_task(preload_next_song(ctx))
                 return
         
-        # Check if there are songs in the queue using the string guild ID
+        # Check if there are songs in the queue - check both string and integer guild IDs
+        queue_to_use = None
         if guild_id_str in queues and queues[guild_id_str] and len(queues[guild_id_str]) > 0:
+            queue_to_use = queues[guild_id_str]
+            logger.info(f"Found queue using string guild_id {guild_id_str}")
+        elif guild_id in queues and queues[guild_id] and len(queues[guild_id]) > 0:
+            # Move queue from integer key to string key for consistency
+            queues[guild_id_str] = queues[guild_id]
+            del queues[guild_id]
+            queue_to_use = queues[guild_id_str]
+            logger.info(f"Found queue using integer guild_id {guild_id}, moved to string key {guild_id_str}")
+        
+        if queue_to_use:
             try:
                 # Log the queue before we pop from it
                 logger.info(f"Queue before popleft: {list(queues[guild_id_str])}")
@@ -1149,6 +1166,13 @@ async def play_next(ctx):
         # No more songs in queue - only show the message if we were actually playing something
         # and the queue is truly empty
         else:
+            logger.info(f"No queue found for guild {guild_id_str}")
+            logger.info(f"Available queue keys: {list(queues.keys())}")
+            # Double-check both string and integer keys for debugging
+            if guild_id_str in queues:
+                logger.info(f"String key {guild_id_str} exists with {len(queues[guild_id_str])} items")
+            if guild_id in queues:
+                logger.info(f"Integer key {guild_id} exists with {len(queues[guild_id])} items")
             logger.info(f"No more songs in queue for guild {guild_id_str}")
             # Check for both string and integer keys for current_song_message
             if guild_id_str in current_song_message and current_song_message[guild_id_str]:
