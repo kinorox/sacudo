@@ -1,6 +1,6 @@
-# Discord Music Bot Dashboard
+# Sacudo Dashboard
 
-A web-based dashboard for managing and monitoring the Discord Music Bot. This dashboard provides a user-friendly interface to control music playback, manage queues, and monitor the status of your music bot.
+A React-based web dashboard for managing and monitoring the Sacudo Discord music bot. This dashboard provides a user-friendly interface to control music playback, manage queues, and monitor the status of your music bot.
 
 ## Features
 
@@ -12,7 +12,7 @@ A web-based dashboard for managing and monitoring the Discord Music Bot. This da
 
 ## Tech Stack
 
-- **Backend**: Flask (Python) with Flask-SocketIO for real-time updates
+- **Backend**: Integrated Flask API in main bot.py with Flask-SocketIO
 - **Frontend**: React with Tailwind CSS for styling
 - **Communication**: WebSockets for real-time updates, REST API for actions
 
@@ -21,49 +21,49 @@ A web-based dashboard for managing and monitoring the Discord Music Bot. This da
 ### Prerequisites
 
 - Node.js and npm
-- Python 3.7+
-- Discord Music Bot running
+- Sacudo bot installed and configured
 
-### Backend Setup
+### Installation
 
-1. Navigate to the backend directory:
-   ```
-   cd dashboard/backend
-   ```
-
-2. Install the required Python packages:
-   ```
-   pip install -r requirements.txt
-   ```
-
-3. Run the API server:
-   ```
-   python run_api.py
-   ```
-
-### Frontend Setup
-
-1. Navigate to the frontend directory:
-   ```
-   cd dashboard/frontend
+1. Navigate to the dashboard directory:
+   ```bash
+   cd dashboard
    ```
 
 2. Install the required npm packages:
-   ```
+   ```bash
    npm install
    ```
 
-3. Start the React development server:
+### Running the Dashboard
+
+#### Option 1: One-command startup (Recommended)
+```bash
+sacudo --with-dashboard
+```
+
+This single command starts the bot, API, and React dashboard all together.
+
+#### Option 2: Using the dashboard npm script
+```bash
+cd dashboard
+npm run start:dev
+```
+
+This will start both the bot with API and the React frontend.
+
+#### Option 3: Manual setup
+1. Start the bot with API:
+   ```bash
+   sacudo --with-api
+   # or directly: python bot.py --with-api
    ```
+
+2. In a separate terminal, start the React development server:
+   ```bash
+   cd dashboard
    npm start
    ```
-
-### Running Both Together
-
-On Windows, you can use the provided batch file to start both the backend and frontend:
-```
-dashboard/run_dashboard.bat
-```
 
 ## Usage
 
@@ -73,20 +73,25 @@ dashboard/run_dashboard.bat
 4. Add new songs to the queue using the input form
 5. Manage the queue by removing or reordering songs
 
-## API Endpoints
+## Development
 
-The dashboard uses a REST API to communicate with the bot. The main endpoints are:
+### Building for Production
 
-- `GET /api/status`: Get overall bot status
-- `GET /api/guilds`: Get all guilds where the bot is present
-- `GET /api/guild/<guild_id>`: Get detailed information about a specific guild
-- `GET /api/guild/<guild_id>/queue`: Get the current queue for a guild
-- `POST /api/guild/<guild_id>/play`: Play a song in the specified guild
-- `POST /api/guild/<guild_id>/skip`: Skip the current song
-- `POST /api/guild/<guild_id>/pause`: Pause the current song
-- `POST /api/guild/<guild_id>/resume`: Resume the current song
-- `POST /api/guild/<guild_id>/stop`: Stop playback and clear the queue
-- `POST /api/guild/<guild_id>/volume`: Set the volume of the current song
+```bash
+cd dashboard
+npm run build
+```
+
+### Running Tests
+
+```bash
+cd dashboard
+npm test
+```
+
+## API Integration
+
+The dashboard communicates with the bot's integrated Flask API running on port 8000 (by default). The React development server proxies API requests to avoid CORS issues.
 
 ## WebSocket Events
 

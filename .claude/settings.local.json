@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(rm:*)",
+      "Bash(sacudo:*)",
+      "Bash(pip install:*)"
+    ],
+    "deny": []
+  }
+}

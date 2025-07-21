@@ -80,20 +80,29 @@ sacudo
 
 This starts the Discord bot without the web dashboard.
 
-### With Web Dashboard
+### With Web Dashboard API
 
 ```bash
 sacudo --with-api
 ```
 
-This starts both the Discord bot and the web dashboard at `http://localhost:8000`.
+This starts the Discord bot with the web API at `http://localhost:8000`.
+
+### With Full Dashboard (Bot + API + React Frontend)
+
+```bash
+sacudo --with-dashboard
+```
+
+This starts the Discord bot, web API, and React dashboard. The API will be available at `http://localhost:8000` and the React frontend at `http://localhost:3000`.
 
 ### Command Line Options
 
 ```bash
-sacudo --help          # Show help message
-sacudo --version       # Show version
-sacudo --with-api      # Run with web dashboard
+sacudo --help              # Show help message
+sacudo --version           # Show version
+sacudo --with-api          # Run with web API only
+sacudo --with-dashboard    # Run with API and React dashboard (requires Node.js)
 ```
 
 ## Discord Commands

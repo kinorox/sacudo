@@ -151,12 +151,12 @@ class YTDLSource(discord.PCMVolumeTransformer):
             if 'url' in data:
                 logger.info(f"Using cached URL for {url}")
                 filename = data['url']
-                ffmpeg_options = {
-                    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-                    'options': '-vn'
-                }
-                # Create the audio source
-                audio_source = discord.FFmpegPCMAudio(filename, **ffmpeg_options)
+                # Create the audio source with proper FFmpeg options
+                audio_source = discord.FFmpegPCMAudio(
+                    filename,
+                    before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+                    options='-vn -ar 48000 -ac 2 -b:a 128k -f s16le'
+                )
                 source = cls(audio_source, data=data)
                 source.volume = 0.8
                 return source
@@ -244,13 +244,12 @@ class YTDLSource(discord.PCMVolumeTransformer):
         # Log important data for debugging
         logger.info(f"Title: {data.get('title')}, URL: {data.get('webpage_url')}, Stream URL: {filename}")
         
-        ffmpeg_options = {
-            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-            'options': '-vn'
-        }
-        
-        # Create the audio source
-        audio_source = discord.FFmpegPCMAudio(filename, **ffmpeg_options)
+        # Create the audio source with proper FFmpeg options
+        audio_source = discord.FFmpegPCMAudio(
+            filename,
+            before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+            options='-vn -ar 48000 -ac 2 -b:a 128k -f s16le'
+        )
         
         # Add a small delay to ensure the source is properly initialized
         await asyncio.sleep(0.5)
@@ -574,6 +573,9 @@ async def join(ctx):
         channel = ctx.message.author.voice.channel
     logger.info(f"Joining voice channel {channel.name} in guild {ctx.guild.id}")
     await channel.connect()
+    
+    # Store the channel for reconnection purposes
+    last_voice_channel[ctx.guild.id] = channel
 
 
 async def fix_queue(guild_id):
@@ -718,8 +720,15 @@ async def handle_play_request(ctx, search: str):
                 # Add a small delay to ensure buffer is filled
                 await asyncio.sleep(0.5)
                 
+                # Verify connection before playing
+                if not ctx.voice_client or not ctx.voice_client.is_connected():
+                    logger.warning(f"Voice client not connected before playing in guild {guild_id_str}")
+                    if not await ensure_voice_connection(ctx):
+                        logger.error(f"Cannot establish voice connection for guild {guild_id_str}")
+                        return f"Error: Cannot establish voice connection."
+                
                 logger.info(f"Playing: {player.title}")
-                ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop).result() if e is None else None)
+                ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop) if e is None else logger.error(f"Audio playback error: {e}"))
                 
                 # Set the current song and log it
                 current_song[guild_id_str] = player
@@ -996,7 +1005,7 @@ async def play_next(ctx):
                         await asyncio.sleep(0.2)  # Small delay to ensure the previous song is fully stopped
                     
                     logger.info(f"Playing preloaded song in guild {guild_id_str}: {player.title}")
-                    ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop).result() if e is None else None)
+                    ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop) if e is None else logger.error(f"Audio playback error: {e}"))
                     current_song[guild_id_str] = player
                     logger.info(f"Set current_song[{guild_id_str}] to {player.title} (preloaded)")
                     
@@ -1067,10 +1076,12 @@ async def play_next(ctx):
                 logger.info(f"Creating player for next song in guild {guild_id_str}")
                 player = await YTDLSource.from_url(next_url, loop=bot.loop, stream=True)
                 
-                # Make sure we're connected to a voice channel
-                if not ctx.voice_client:
-                    logger.info(f"Bot not in voice channel, joining for guild {guild_id_str}")
-                    await ctx.invoke(join)
+                # Ensure we have a stable voice connection
+                if not await ensure_voice_connection(ctx):
+                    logger.error(f"Failed to establish voice connection for guild {guild_id_str}")
+                    # Try the next song if connection fails
+                    asyncio.create_task(play_next(ctx))
+                    return
                 
                 # Add a small delay to ensure buffer is filled
                 await asyncio.sleep(0.5)
@@ -1081,9 +1092,18 @@ async def play_next(ctx):
                     ctx.voice_client.stop()
                     await asyncio.sleep(0.2)  # Small delay to ensure the previous song is fully stopped
                 
+                # Verify connection is still stable before playing
+                if not ctx.voice_client or not ctx.voice_client.is_connected():
+                    logger.warning(f"Voice client disconnected, attempting reconnection for guild {guild_id_str}")
+                    if not await ensure_voice_connection(ctx):
+                        logger.error(f"Cannot establish voice connection for next song in guild {guild_id_str}")
+                        # Try again later
+                        asyncio.create_task(play_next(ctx))
+                        return
+                
                 # Play the next song
                 logger.info(f"Playing next song in guild {guild_id_str}: {player.title}")
-                ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop).result() if e is None else None)
+                ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop) if e is None else logger.error(f"Audio playback error: {e}"))
                 current_song[guild_id_str] = player
                 logger.info(f"Set current_song[{guild_id_str}] to {player.title} (from queue)")
                 
@@ -1295,6 +1315,7 @@ async def handle_playlist(ctx, url):
         'ignoreerrors': True,
         'nocheckcertificate': True,
         'skip_download': True,
+        'playlistend': 50,  # Limit playlist size for performance
         # Don't include 'noplaylist' option here since we want to extract playlists
     }
     
@@ -1318,14 +1339,18 @@ async def handle_playlist(ctx, url):
                 redirect_url = info_dict.get('url')
                 logger.info(f"Got redirect URL, trying to extract: {redirect_url}")
                 if redirect_url and redirect_url != url:
-                    # Try extracting from the redirect URL
-                    info_dict = ydl.extract_info(redirect_url, download=False)
-                    logger.info(f"Redirect extraction result: {type(info_dict)}")
-                    if info_dict:
-                        logger.info(f"Redirect info dict keys: {list(info_dict.keys())}")
-                        entries = info_dict.get('entries')
-                        if entries:
-                            logger.info(f"Found {len(entries)} entries from redirect URL")
+                    try:
+                        # Try extracting from the redirect URL with timeout
+                        info_dict = ydl.extract_info(redirect_url, download=False)
+                        logger.info(f"Redirect extraction result: {type(info_dict)}")
+                        if info_dict:
+                            logger.info(f"Redirect info dict keys: {list(info_dict.keys())}")
+                            entries = info_dict.get('entries')
+                            if entries:
+                                logger.info(f"Found {len(entries)} entries from redirect URL")
+                    except Exception as redirect_error:
+                        logger.error(f"Error processing redirect URL {redirect_url}: {redirect_error}")
+                        # Continue with original processing if redirect fails
             
             if not entries:
                 logger.warning(f"No entries found in playlist: {url}")
@@ -1347,12 +1372,24 @@ async def handle_playlist(ctx, url):
     unique_urls = set()
     added_count = 0
     
-    # First, add all unique URLs to the queue
+    # First, add all unique URLs to the queue (with progress feedback for large playlists)
+    total_entries = len(entries)
+    processed = 0
+    
     for entry in entries:
         if entry and 'url' in entry and entry['url'] not in unique_urls:
             unique_urls.add(entry['url'])
             queues[guild_id_str].append(entry['url'])
             added_count += 1
+        
+        processed += 1
+        # Send progress update for large playlists
+        if total_entries > 20 and processed % 10 == 0:
+            logger.info(f"Processing playlist: {processed}/{total_entries} songs")
+            try:
+                await ctx.send(f"📊 Processing playlist: {processed}/{total_entries} songs...", delete_after=5)
+            except:
+                pass  # Don't fail if we can't send progress update
     
     if added_count == 0:
         logger.warning(f"No unique songs found to add from playlist {url} for guild {guild_id_str}")
@@ -1385,7 +1422,7 @@ async def handle_playlist(ctx, url):
                 await asyncio.sleep(0.5)
                 
                 logger.info(f"Playing first song from playlist: {player.title} for guild {guild_id_str}")
-                ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop).result() if e is None else None)
+                ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop) if e is None else logger.error(f"Audio playback error: {e}"))
                 current_song[guild_id_str] = player
                 
                 await update_music_message(ctx, player)
@@ -1514,34 +1551,137 @@ async def debug(ctx):
     # Send the debug information
     await ctx.send(embed=embed)
     
-    # If there were issues, try to play the next song
-    if issues_found and ctx.voice_client and not ctx.voice_client.is_playing():
-        logger.info(f"Attempting to play next song after diagnosis in guild {guild_id}")
+    # Check if bot should try to play next song (removed problematic issues_found check)
+    if ctx.voice_client and not ctx.voice_client.is_playing() and not ctx.voice_client.is_paused():
+        # If voice client exists but nothing is playing and not paused, try to play next song
+        logger.info(f"Voice client not playing, attempting to play next song in guild {guild_id}")
         asyncio.create_task(play_next(ctx))
+
+# Store the last connected voice channel per guild for reconnection
+last_voice_channel = {}
+
+async def ensure_voice_connection(ctx, max_retries=3):
+    """Ensure we have a stable voice connection, attempt reconnection if needed."""
+    guild_id = ctx.guild.id
+    
+    for attempt in range(max_retries):
+        try:
+            # Check if we already have a connected voice client
+            if ctx.voice_client and ctx.voice_client.is_connected():
+                return True
+                
+            # Try to reconnect to the last known channel
+            if guild_id in last_voice_channel:
+                channel = last_voice_channel[guild_id]
+                logger.info(f"Attempting to reconnect to voice channel {channel.name} in guild {guild_id} (attempt {attempt + 1})")
+                
+                # Disconnect existing client if it exists but isn't connected
+                if ctx.voice_client:
+                    try:
+                        await ctx.voice_client.disconnect()
+                    except:
+                        pass
+                
+                # Connect to the channel
+                voice_client = await channel.connect()
+                if voice_client and voice_client.is_connected():
+                    logger.info(f"Successfully reconnected to voice channel in guild {guild_id}")
+                    ctx.voice_client = voice_client  # Update the context
+                    return True
+            else:
+                logger.warning(f"No previous voice channel stored for guild {guild_id}")
+                return False
+                
+        except discord.errors.ConnectionClosed as e:
+            logger.warning(f"Discord connection closed during reconnection attempt {attempt + 1} for guild {guild_id}: {e}")
+            if e.code == 4006:  # Session invalid
+                logger.info(f"Session invalid (4006), forcing reconnection for guild {guild_id}")
+                # Force disconnect and try again
+                if ctx.voice_client:
+                    try:
+                        await ctx.voice_client.disconnect(force=True)
+                    except:
+                        pass
+                    ctx.voice_client = None
+        except Exception as e:
+            logger.warning(f"Voice reconnection attempt {attempt + 1} failed for guild {guild_id}: {e}")
+            
+        if attempt < max_retries - 1:
+            await asyncio.sleep(2 ** attempt)  # Exponential backoff
+    
+    logger.error(f"Failed to establish voice connection after {max_retries} attempts for guild {guild_id}")
+    return False
 
 @bot.event
 async def on_voice_state_update(member, before, after):
     """Handle voice state updates to clean up when the bot is disconnected."""
+    guild_id = None
+    
     # Check if the bot was disconnected
-    if member.id == bot.user.id and before.channel and not after.channel:
-        guild_id = before.channel.guild.id
-        logger.info(f"Bot disconnected from voice channel in guild {guild_id}")
+    if member.id == bot.user.id:
+        if before.channel and not after.channel:
+            guild_id = before.channel.guild.id
+            logger.info(f"Bot disconnected from voice channel in guild {guild_id}")
+            
+            # Store the channel for potential reconnection
+            last_voice_channel[guild_id] = before.channel
+            
+            # Clean up resources
+            if guild_id in current_song and current_song[guild_id]:
+                logger.info(f"Cleaning up current song in guild {guild_id}")
+                current_song[guild_id].cleanup()
+                current_song[guild_id] = None
+                
+            if guild_id in preloaded_songs and preloaded_songs[guild_id]:
+                logger.info(f"Cleaning up preloaded song in guild {guild_id}")
+                preloaded_songs[guild_id].cleanup()
+                preloaded_songs[guild_id] = None
+                
+            # Reset the playing lock
+            if guild_id in playing_locks:
+                logger.info(f"Resetting playing lock in guild {guild_id}")
+                playing_locks[guild_id] = False
+            
+            # Try to reconnect and continue playback if there's a queue
+            if guild_id in queues and queues[str(guild_id)] and len(queues[str(guild_id)]) > 0:
+                logger.info(f"Queue exists for guild {guild_id}, attempting reconnection")
+                
+                # Create a fake context for reconnection
+                guild = bot.get_guild(guild_id)
+                if guild:
+                    # Get any text channel to create a fake context
+                    text_channel = next((ch for ch in guild.text_channels if ch.permissions_for(guild.me).send_messages), None)
+                    if text_channel:
+                        fake_ctx = await bot.get_context(await text_channel.fetch_message(text_channel.last_message_id) if text_channel.last_message_id else None)
+                        fake_ctx.guild = guild
+                        fake_ctx.voice_client = None
+                        
+                        # Attempt reconnection after a short delay
+                        asyncio.create_task(reconnect_and_resume(fake_ctx))
+        elif after.channel and not before.channel:
+            # Bot connected to a new channel
+            guild_id = after.channel.guild.id
+            last_voice_channel[guild_id] = after.channel
+            logger.info(f"Bot connected to voice channel {after.channel.name} in guild {guild_id}")
+
+async def reconnect_and_resume(ctx):
+    """Attempt to reconnect and resume playback."""
+    await asyncio.sleep(5)  # Wait before attempting reconnection
+    guild_id = ctx.guild.id
+    
+    try:
+        logger.info(f"Attempting to reconnect and resume playback for guild {guild_id}")
         
-        # Clean up resources
-        if guild_id in current_song and current_song[guild_id]:
-            logger.info(f"Cleaning up current song in guild {guild_id}")
-            current_song[guild_id].cleanup()
-            current_song[guild_id] = None
+        # Try to establish voice connection
+        if await ensure_voice_connection(ctx):
+            logger.info(f"Reconnected successfully, resuming playback for guild {guild_id}")
+            # Resume playback
+            await play_next(ctx)
+        else:
+            logger.error(f"Failed to reconnect for guild {guild_id}")
             
-        if guild_id in preloaded_songs and preloaded_songs[guild_id]:
-            logger.info(f"Cleaning up preloaded song in guild {guild_id}")
-            preloaded_songs[guild_id].cleanup()
-            preloaded_songs[guild_id] = None
-            
-        # Reset the playing lock
-        if guild_id in playing_locks:
-            logger.info(f"Resetting playing lock in guild {guild_id}")
-            playing_locks[guild_id] = False
+    except Exception as e:
+        logger.error(f"Error during reconnection attempt for guild {guild_id}: {e}")
 
 @bot.command()
 async def volume(ctx, volume: int):
@@ -2112,9 +2252,13 @@ def play_song(guild_id):
                 result = await handle_playlist(fake_ctx, search)
                 return result
                 
-            # Run the async function in the bot's event loop
-            result = asyncio.run_coroutine_threadsafe(run_playlist_handler(), bot.loop).result()
+            # Run the async function in the bot's event loop with timeout
+            future = asyncio.run_coroutine_threadsafe(run_playlist_handler(), bot.loop)
+            result = future.result(timeout=30)  # 30 second timeout
             return jsonify({"success": True, "message": "Playlist added to queue"}), 200
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout handling playlist in API endpoint: {search}")
+            return jsonify({"error": "Playlist processing timed out. Try a smaller playlist."}), 408
         except Exception as e:
             logger.error(f"Error handling playlist in API endpoint: {e}")
             logger.error(traceback.format_exc())
@@ -2760,7 +2904,7 @@ async def talk(ctx, *, text: str):
     source = discord.FFmpegPCMAudio(
         temp_filename,
         before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-        options="-vn"
+        options="-vn -ar 48000 -ac 2 -b:a 128k -f s16le"
     )
     voice_client.play(source, after=lambda e: _after_tts(e, temp_filename, resume_after, voice_client))
     await ctx.send(f"🔊 Speaking: \"{text}\"")

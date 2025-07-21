@@ -2,11 +2,8 @@
 
 # Log files
 *.log
-bot_*.log
-dashboard_api.log
-bot_startup.log
-api_startup.log
-frontend_startup.log
+*.log.*
+bot.pid
 
 # Python
 __pycache__/
@@ -46,9 +43,6 @@ env/
 Thumbs.db
 
 cookies.txt
-bare_cookies.txt
-fixed_cookies.txt
-manual_cookies.txt
 
 # Dashboard specific
 dashboard/node_modules/
@@ -56,9 +50,6 @@ dashboard/.pnp
 dashboard/.pnp.js
 dashboard/coverage/
 dashboard/build/
-
-# Testing
-dashboard/coverage/
 
 # Misc
 .env.local
@@ -69,4 +60,3 @@ dashboard/coverage/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-bot.log*
