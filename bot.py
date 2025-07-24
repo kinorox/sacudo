@@ -571,8 +571,28 @@ async def join(ctx):
         return
     else:
         channel = ctx.message.author.voice.channel
+    
     logger.info(f"Joining voice channel {channel.name} in guild {ctx.guild.id}")
-    await channel.connect()
+    
+    # Add retry logic for voice connection with proper error handling
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            await channel.connect()
+            break
+        except IndexError as e:
+            if "list index out of range" in str(e) and attempt < max_retries - 1:
+                logger.warning(f"Voice connection attempt {attempt + 1} failed with IndexError (empty modes array), retrying...")
+                await asyncio.sleep(1)  # Brief delay before retry
+                continue
+            else:
+                logger.error(f"Voice connection failed after {max_retries} attempts: {e}")
+                await ctx.send("Failed to connect to voice channel. Discord voice servers may be experiencing issues. Please try again later.")
+                return
+        except Exception as e:
+            logger.error(f"Unexpected error during voice connection: {e}")
+            await ctx.send(f"Failed to connect to voice channel: {e}")
+            return
     
     # Store the channel for reconnection purposes
     last_voice_channel[ctx.guild.id] = channel
@@ -720,12 +740,55 @@ async def handle_play_request(ctx, search: str):
                 # Add a small delay to ensure buffer is filled
                 await asyncio.sleep(0.5)
                 
-                # Verify connection before playing
-                if not ctx.voice_client or not ctx.voice_client.is_connected():
+                # Verify connection before playing - handle Discord API state issues
+                voice_client_ready = False
+                if ctx.voice_client and ctx.voice_client.is_connected():
+                    voice_client_ready = True
+                elif ctx.guild.voice_client and ctx.guild.voice_client.is_connected():
+                    # Discord API state issue workaround
+                    logger.info(f"Using guild voice client as fallback for guild {guild_id_str}")
+                    ctx.voice_client = ctx.guild.voice_client
+                    voice_client_ready = True
+                
+                if not voice_client_ready:
                     logger.warning(f"Voice client not connected before playing in guild {guild_id_str}")
-                    if not await ensure_voice_connection(ctx):
+                    
+                    # Try force disconnect and clean reconnection due to Discord API issues
+                    logger.info(f"Attempting force disconnect and clean reconnection for guild {guild_id_str}")
+                    
+                    # Force disconnect any existing connections
+                    for client in [ctx.voice_client, ctx.guild.voice_client]:
+                        if client:
+                            try:
+                                await client.disconnect(force=True)
+                                logger.info(f"Force disconnected voice client for guild {guild_id_str}")
+                            except:
+                                pass
+                    
+                    # Clear the context
+                    ctx.voice_client = None
+                    
+                    # Wait a moment for Discord to process the disconnect
+                    await asyncio.sleep(2)
+                    
+                    # Try to reconnect using the join function directly
+                    if guild_id in last_voice_channel:
+                        channel = last_voice_channel[guild_id]
+                        try:
+                            logger.info(f"Attempting clean reconnection to {channel.name} for guild {guild_id_str}")
+                            voice_client = await channel.connect()
+                            if voice_client and voice_client.is_connected():
+                                ctx.voice_client = voice_client
+                                logger.info(f"Successfully reconnected after force disconnect for guild {guild_id_str}")
+                                voice_client_ready = True
+                            else:
+                                logger.error(f"Clean reconnection failed for guild {guild_id_str}")
+                        except Exception as e:
+                            logger.error(f"Clean reconnection error for guild {guild_id_str}: {e}")
+                    
+                    if not voice_client_ready:
                         logger.error(f"Cannot establish voice connection for guild {guild_id_str}")
-                        return f"Error: Cannot establish voice connection."
+                        return f"Error: Cannot establish voice connection due to Discord API issues. Try using the !join command first."
                 
                 logger.info(f"Playing: {player.title}")
                 ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop) if e is None else logger.error(f"Audio playback error: {e}"))
@@ -1564,45 +1627,80 @@ async def ensure_voice_connection(ctx, max_retries=3):
     """Ensure we have a stable voice connection, attempt reconnection if needed."""
     guild_id = ctx.guild.id
     
+    # First, check if we already have a working connection
+    if ctx.voice_client and ctx.voice_client.is_connected():
+        logger.info(f"Voice client already connected for guild {guild_id}")
+        return True
+    
+    # Check if guild has a voice client we can use
+    if ctx.guild.voice_client and ctx.guild.voice_client.is_connected():
+        logger.info(f"Found existing guild voice client for guild {guild_id}, updating context")
+        ctx.voice_client = ctx.guild.voice_client
+        return True
+    
+    # Try to reconnect to the last known channel
+    if guild_id not in last_voice_channel:
+        logger.warning(f"No previous voice channel stored for guild {guild_id}")
+        return False
+    
+    channel = last_voice_channel[guild_id]
+    
     for attempt in range(max_retries):
         try:
-            # Check if we already have a connected voice client
-            if ctx.voice_client and ctx.voice_client.is_connected():
+            logger.info(f"Attempting to reconnect to voice channel {channel.name} in guild {guild_id} (attempt {attempt + 1})")
+            
+            # Only disconnect if we have a non-working connection
+            if ctx.voice_client and not ctx.voice_client.is_connected():
+                try:
+                    await ctx.voice_client.disconnect()
+                    ctx.voice_client = None
+                except:
+                    pass
+            
+            # Only disconnect guild client if it's not working
+            if ctx.guild.voice_client and not ctx.guild.voice_client.is_connected():
+                try:
+                    await ctx.guild.voice_client.disconnect()
+                except:
+                    pass
+            
+            # Try to connect with IndexError retry built-in
+            voice_client = None
+            connection_retries = 3
+            for conn_attempt in range(connection_retries):
+                try:
+                    voice_client = await channel.connect()
+                    break
+                except IndexError as e:
+                    if "list index out of range" in str(e) and conn_attempt < connection_retries - 1:
+                        logger.warning(f"Voice connection attempt {conn_attempt + 1} failed with IndexError (empty modes array), retrying...")
+                        await asyncio.sleep(1)
+                        continue
+                    else:
+                        logger.error(f"Voice connection failed after {connection_retries} IndexError retries")
+                        raise e
+                except discord.errors.ClientException as e:
+                    if "Already connected to a voice channel" in str(e):
+                        # Check if we can find the existing connection
+                        if ctx.guild.voice_client and ctx.guild.voice_client.is_connected():
+                            logger.info(f"Found existing connection after 'already connected' error")
+                            voice_client = ctx.guild.voice_client
+                            break
+                        else:
+                            logger.warning(f"'Already connected' but no valid client found, this may indicate a state issue")
+                            raise e
+                    else:
+                        raise e
+            
+            if voice_client and voice_client.is_connected():
+                logger.info(f"Successfully connected to voice channel in guild {guild_id}")
+                ctx.voice_client = voice_client
                 return True
-                
-            # Try to reconnect to the last known channel
-            if guild_id in last_voice_channel:
-                channel = last_voice_channel[guild_id]
-                logger.info(f"Attempting to reconnect to voice channel {channel.name} in guild {guild_id} (attempt {attempt + 1})")
-                
-                # Disconnect existing client if it exists but isn't connected
-                if ctx.voice_client:
-                    try:
-                        await ctx.voice_client.disconnect()
-                    except:
-                        pass
-                
-                # Connect to the channel
-                voice_client = await channel.connect()
-                if voice_client and voice_client.is_connected():
-                    logger.info(f"Successfully reconnected to voice channel in guild {guild_id}")
-                    ctx.voice_client = voice_client  # Update the context
-                    return True
             else:
-                logger.warning(f"No previous voice channel stored for guild {guild_id}")
-                return False
+                logger.warning(f"Voice connection attempt {attempt + 1} failed - no valid client obtained")
                 
         except discord.errors.ConnectionClosed as e:
             logger.warning(f"Discord connection closed during reconnection attempt {attempt + 1} for guild {guild_id}: {e}")
-            if e.code == 4006:  # Session invalid
-                logger.info(f"Session invalid (4006), forcing reconnection for guild {guild_id}")
-                # Force disconnect and try again
-                if ctx.voice_client:
-                    try:
-                        await ctx.voice_client.disconnect(force=True)
-                    except:
-                        pass
-                    ctx.voice_client = None
         except Exception as e:
             logger.warning(f"Voice reconnection attempt {attempt + 1} failed for guild {guild_id}: {e}")
             
