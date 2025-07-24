@@ -440,10 +440,22 @@ async def handle_stop_request(ctx):
     
     # Clear the queue and current song BEFORE stopping to prevent race condition
     # This prevents play_next from trying to play the next song when stop() triggers the after callback
+    
+    # Clear queue using both integer and string keys to ensure it's cleared
+    queue_cleared = False
     if guild_id in queues:
         queues[guild_id].clear()
-        logger.info(f"Cleared queue for guild {guild_id_str}")
+        logger.info(f"Cleared queue for guild {guild_id_str} (int key)")
+        queue_cleared = True
+    if guild_id_str in queues:
+        queues[guild_id_str].clear()
+        logger.info(f"Cleared queue for guild {guild_id_str} (string key)")
+        queue_cleared = True
     
+    if not queue_cleared:
+        logger.warning(f"No queue found to clear for guild {guild_id_str}")
+    
+    # Clear current song using both keys
     if guild_id_str in current_song:
         current_song[guild_id_str] = None
         logger.info(f"Cleared current song for guild {guild_id_str}")
