@@ -84,8 +84,37 @@ intents.guilds = True
 intents.voice_states = True
 intents.message_content = True
 
-# Define the bot
+# Define the bot with improved voice client settings
 bot = commands.Bot(command_prefix='!', intents=intents)
+
+# Configure FFmpeg path for Windows
+import shutil
+ffmpeg_path = shutil.which('ffmpeg')
+if not ffmpeg_path:
+    ffmpeg_path = r'C:\ffmpeg\bin\ffmpeg.exe'
+    
+discord.FFmpegPCMAudio.executable = ffmpeg_path
+
+# Add improved voice client settings
+discord.voice_client.VoiceClient.warn_nacl = False
+
+# Additional voice connection improvements for error 4006
+try:
+    # Set voice client parameters to help with 4006 errors
+    original_voice_state_init = discord.VoiceProtocol.__init__
+    
+    def patched_voice_init(self, client, channel):
+        """Patched voice protocol init with better settings"""
+        original_voice_state_init(self, client, channel)
+        # Force region to None to let Discord auto-select
+        if hasattr(self, '_voice_state'):
+            self._voice_state.region = None
+    
+    discord.VoiceProtocol.__init__ = patched_voice_init
+    logger.info("Applied voice connection patches for 4006 error mitigation")
+    
+except Exception as e:
+    logger.warning(f"Could not apply voice patches: {e}")
 
 youtube_dl.utils.bug_reports_message = lambda: ''
 
@@ -566,6 +595,423 @@ async def on_ready():
     bot.uptime = time.time()
     logger.info("Bot is ready!")
 
+@bot.event
+async def on_error(event, *args, **kwargs):
+    """Global error handler for bot events"""
+    logger.error(f"Error in event {event}: {args} {kwargs}")
+    # Log the full traceback for debugging
+    import traceback
+    logger.error(f"Full traceback: {traceback.format_exc()}")
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Handle voice state updates to clean up when the bot is disconnected."""
+    try:
+        guild_id = None
+        
+        # Check if the bot was disconnected
+        if member.id == bot.user.id:
+            if before.channel and not after.channel:
+                guild_id = before.channel.guild.id
+                logger.info(f"Bot disconnected from voice channel in guild {guild_id}")
+                
+                # Store the channel for potential reconnection
+                last_voice_channel[guild_id] = before.channel
+                
+                # Clean up resources
+                if guild_id in current_song and current_song[guild_id]:
+                    logger.info(f"Cleaning up current song in guild {guild_id}")
+                    current_song[guild_id].cleanup()
+                    current_song[guild_id] = None
+                    
+                if guild_id in preloaded_songs and preloaded_songs[guild_id]:
+                    logger.info(f"Cleaning up preloaded song in guild {guild_id}")
+                    preloaded_songs[guild_id].cleanup()
+                    preloaded_songs[guild_id] = None
+                    
+                # Reset the playing lock
+                if guild_id in playing_locks:
+                    logger.info(f"Resetting playing lock in guild {guild_id}")
+                    playing_locks[guild_id] = False
+                
+                # Try to reconnect and continue playback if there's a queue
+                if guild_id in queues and queues[str(guild_id)] and len(queues[str(guild_id)]) > 0:
+                    logger.info(f"Queue exists for guild {guild_id}, attempting reconnection")
+                    
+                    # Create a fake context for reconnection
+                    guild = bot.get_guild(guild_id)
+                    if guild:
+                        # Get any text channel to create a fake context
+                        text_channel = next((ch for ch in guild.text_channels if ch.permissions_for(guild.me).send_messages), None)
+                        if text_channel:
+                            fake_ctx = await bot.get_context(await text_channel.fetch_message(text_channel.last_message_id) if text_channel.last_message_id else None)
+                            fake_ctx.guild = guild
+                            # We can't directly assign to fake_ctx.voice_client, but we can work with the guild's voice client
+                            
+                            # Attempt reconnection after a short delay
+                            asyncio.create_task(reconnect_and_resume(fake_ctx))
+            elif after.channel and not before.channel:
+                # Bot connected to a new channel
+                guild_id = after.channel.guild.id
+                last_voice_channel[guild_id] = after.channel
+                logger.info(f"Bot connected to voice channel {after.channel.name} in guild {guild_id}")
+    except Exception as e:
+        logger.error(f"Error in voice state update handler: {e}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+
+# Add voice connection error handling
+async def handle_voice_connection_error(guild_id, error, context="unknown"):
+    """Handle voice connection errors with proper logging and recovery"""
+    guild_id_str = str(guild_id)
+    logger.error(f"Voice connection error in guild {guild_id_str} ({context}): {error}")
+    
+    # Check if it's a 4006 error (session ended)
+    if hasattr(error, 'code') and error.code == 4006:
+        logger.warning(f"Session ended error (4006) for guild {guild_id_str}, attempting recovery")
+        
+        # Wait a bit before attempting recovery
+        await asyncio.sleep(5)
+        
+        # Try to clean up any existing connections
+        guild = bot.get_guild(guild_id)
+        if guild and guild.voice_client:
+            try:
+                await guild.voice_client.disconnect(force=True)
+                logger.info(f"Force disconnected voice client for guild {guild_id_str} after 4006 error")
+            except Exception as e:
+                logger.error(f"Error during force disconnect for guild {guild_id_str}: {e}")
+        
+        # If there's a queue, try to reconnect
+        if guild_id_str in queues and queues[guild_id_str] and len(queues[guild_id_str]) > 0:
+            logger.info(f"Attempting to reconnect after 4006 error for guild {guild_id_str}")
+            # Create a task to attempt reconnection
+            asyncio.create_task(delayed_reconnect_attempt(guild_id))
+    
+    # For other errors, log and potentially attempt recovery
+    elif hasattr(error, 'code'):
+        logger.error(f"Discord error code {error.code} for guild {guild_id_str}: {error}")
+    else:
+        logger.error(f"Unknown voice connection error for guild {guild_id_str}: {error}")
+
+async def delayed_reconnect_attempt(guild_id):
+    """Attempt reconnection after a delay"""
+    await asyncio.sleep(10)  # Wait 10 seconds before attempting reconnection
+    
+    try:
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            logger.error(f"Guild {guild_id} not found during reconnection attempt")
+            return
+        
+        # Check if we have a last known channel
+        if guild_id in last_voice_channel:
+            channel = last_voice_channel[guild_id]
+            logger.info(f"Attempting reconnection to {channel.name} for guild {guild_id}")
+            
+            try:
+                voice_client = await channel.connect()
+                if voice_client and voice_client.is_connected():
+                    logger.info(f"Successfully reconnected to {channel.name} for guild {guild_id}")
+                    # Resume playback if there's a queue
+                    if str(guild_id) in queues and queues[str(guild_id)]:
+                        await play_next_from_queue(guild_id)
+                else:
+                    logger.error(f"Reconnection failed for guild {guild_id}")
+            except Exception as e:
+                logger.error(f"Error during reconnection attempt for guild {guild_id}: {e}")
+        else:
+            logger.warning(f"No last known channel for guild {guild_id}, cannot attempt reconnection")
+            
+    except Exception as e:
+        logger.error(f"Error in delayed reconnection attempt for guild {guild_id}: {e}")
+
+async def play_next_from_queue(guild_id):
+    """Play the next song from the queue for a specific guild"""
+    try:
+        guild_id_str = str(guild_id)
+        if guild_id_str in queues and queues[guild_id_str]:
+            # Get the next song from the queue
+            next_song = queues[guild_id_str].popleft()
+            logger.info(f"Playing next song from queue for guild {guild_id}: {next_song}")
+            
+            # Create a fake context for playing
+            guild = bot.get_guild(guild_id)
+            if guild:
+                text_channel = next((ch for ch in guild.text_channels if ch.permissions_for(guild.me).send_messages), None)
+
+                if text_channel:
+                    fake_ctx = await bot.get_context(await text_channel.fetch_message(text_channel.last_message_id) if text_channel.last_message_id else None)
+                    fake_ctx.guild = guild
+                    
+                    # Try to play the song
+                    await handle_play_request(fake_ctx, next_song)
+                    
+    except Exception as e:
+        logger.error(f"Error playing next song from queue for guild {guild_id}: {e}")
+
+# Add a global voice connection error handler
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Handle voice state updates to clean up when the bot is disconnected."""
+    try:
+        guild_id = None
+        
+        # Check if the bot was disconnected
+        if member.id == bot.user.id:
+            if before.channel and not after.channel:
+                guild_id = before.channel.guild.id
+                logger.info(f"Bot disconnected from voice channel in guild {guild_id}")
+                
+                # Store the channel for potential reconnection
+                last_voice_channel[guild_id] = before.channel
+                
+                # Clean up resources
+                if guild_id in current_song and current_song[guild_id]:
+                    logger.info(f"Cleaning up current song in guild {guild_id}")
+                    current_song[guild_id].cleanup()
+                    current_song[guild_id] = None
+                    
+                if guild_id in preloaded_songs and preloaded_songs[guild_id]:
+                    logger.info(f"Cleaning up preloaded song in guild {guild_id}")
+                    preloaded_songs[guild_id].cleanup()
+                    preloaded_songs[guild_id] = None
+                    
+                # Reset the playing lock
+                if guild_id in playing_locks:
+                    logger.info(f"Resetting playing lock in guild {guild_id}")
+                    playing_locks[guild_id] = None
+                    
+                # Try to reconnect and continue playback if there's a queue
+                if guild_id in queues and queues[str(guild_id)] and len(queues[str(guild_id)]) > 0:
+                    logger.info(f"Queue exists for guild {guild_id}, attempting reconnection")
+                    
+                    # Create a fake context for reconnection
+                    guild = bot.get_guild(guild_id)
+                    if guild:
+                        # Get any text channel to create a fake context
+                        text_channel = next((ch for ch in guild.text_channels if ch.permissions_for(guild.me).send_messages), None)
+                        if text_channel:
+                            fake_ctx = await bot.get_context(await text_channel.fetch_message(text_channel.last_message_id) if text_channel.last_message_id else None)
+                            fake_ctx.guild = guild
+                            # We can't directly assign to fake_ctx.voice_client, but we can work with the guild's voice client
+                            
+                            # Attempt reconnection after a short delay
+                            asyncio.create_task(reconnect_and_resume(fake_ctx))
+            elif after.channel and not before.channel:
+                # Bot connected to a new channel
+                guild_id = after.channel.guild.id
+                last_voice_channel[guild_id] = after.channel
+                logger.info(f"Bot connected to voice channel {after.channel.name} in guild {guild_id}")
+    except Exception as e:
+        logger.error(f"Error in voice state update handler: {e}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Handle voice state updates to clean up when the bot is disconnected."""
+    try:
+        guild_id = None
+        
+        # Check if the bot was disconnected
+        if member.id == bot.user.id:
+            if before.channel and not after.channel:
+                guild_id = before.channel.guild.id
+                logger.info(f"Bot disconnected from voice channel in guild {guild_id}")
+                
+                # Store the channel for potential reconnection
+                last_voice_channel[guild_id] = before.channel
+                
+                # Clean up resources
+                if guild_id in current_song and current_song[guild_id]:
+                    logger.info(f"Cleaning up current song in guild {guild_id}")
+                    current_song[guild_id].cleanup()
+                    current_song[guild_id] = None
+                    
+                if guild_id in preloaded_songs and preloaded_songs[guild_id]:
+                    logger.info(f"Cleaning up preloaded song in guild {guild_id}")
+                    preloaded_songs[guild_id].cleanup()
+                    preloaded_songs[guild_id] = None
+                    
+                # Reset the playing lock
+                if guild_id in playing_locks:
+                    logger.info(f"Resetting playing lock in guild {guild_id}")
+                    playing_locks[guild_id] = False
+                
+                # Try to reconnect and continue playback if there's a queue
+                if guild_id in queues and queues[str(guild_id)] and len(queues[str(guild_id)]) > 0:
+                    logger.info(f"Queue exists for guild {guild_id}, attempting reconnection")
+                    
+                    # Create a fake context for reconnection
+                    guild = bot.get_guild(guild_id)
+                    if guild:
+                        # Get any text channel to create a fake context
+                        text_channel = next((ch for ch in guild.text_channels if ch.permissions_for(guild.me).send_messages), None)
+                        if text_channel:
+                            fake_ctx = await bot.get_context(await text_channel.fetch_message(text_channel.last_message_id) if text_channel.last_message_id else None)
+                            fake_ctx.guild = guild
+                            # We can't directly assign to fake_ctx.voice_client, but we can work with the guild's voice client
+                            
+                            # Attempt reconnection after a short delay
+                            asyncio.create_task(reconnect_and_resume(fake_ctx))
+            elif after.channel and not before.channel:
+                # Bot connected to a new channel
+                guild_id = after.channel.guild.id
+                last_voice_channel[guild_id] = after.channel
+                logger.info(f"Bot connected to voice channel {after.channel.name} in guild {guild_id}")
+    except Exception as e:
+        logger.error(f"Error in voice state update handler: {e}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+
+# Add voice connection error handling
+async def handle_voice_connection_error(guild_id, error, context="unknown"):
+    """Handle voice connection errors with proper logging and recovery"""
+    guild_id_str = str(guild_id)
+    logger.error(f"Voice connection error in guild {guild_id_str} ({context}): {error}")
+    
+    # Check if it's a 4006 error (session ended)
+    if hasattr(error, 'code') and error.code == 4006:
+        logger.warning(f"Session ended error (4006) for guild {guild_id_str}, attempting recovery")
+        
+        # Wait a bit before attempting recovery
+        await asyncio.sleep(5)
+        
+        # Try to clean up any existing connections
+        guild = bot.get_guild(guild_id)
+        if guild and guild.voice_client:
+            try:
+                await guild.voice_client.disconnect(force=True)
+                logger.info(f"Force disconnected voice client for guild {guild_id_str} after 4006 error")
+            except Exception as e:
+                logger.error(f"Error during force disconnect for guild {guild_id_str}: {e}")
+        
+        # If there's a queue, try to reconnect
+        if guild_id_str in queues and queues[guild_id_str] and len(queues[guild_id_str]) > 0:
+            logger.info(f"Attempting to reconnect after 4006 error for guild {guild_id_str}")
+            # Create a task to attempt reconnection
+            asyncio.create_task(delayed_reconnect_attempt(guild_id))
+    
+    # For other errors, log and potentially attempt recovery
+    elif hasattr(error, 'code'):
+        logger.error(f"Discord error code {error.code} for guild {guild_id_str}: {error}")
+    else:
+        logger.error(f"Unknown voice connection error for guild {guild_id_str}: {error}")
+
+async def delayed_reconnect_attempt(guild_id):
+    """Attempt reconnection after a delay"""
+    await asyncio.sleep(10)  # Wait 10 seconds before attempting reconnection
+    
+    try:
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            logger.error(f"Guild {guild_id} not found during reconnection attempt")
+            return
+        
+        # Check if we have a last known channel
+        if guild_id in last_voice_channel:
+            channel = last_voice_channel[guild_id]
+            logger.info(f"Attempting reconnection to {channel.name} for guild {guild_id}")
+            
+            try:
+                voice_client = await channel.connect()
+                if voice_client and voice_client.is_connected():
+                    logger.info(f"Successfully reconnected to {channel.name} for guild {guild_id}")
+                    # Resume playback if there's a queue
+                    if str(guild_id) in queues and queues[str(guild_id)]:
+                        await play_next_from_queue(guild_id)
+                else:
+                    logger.error(f"Reconnection failed for guild {guild_id}")
+            except Exception as e:
+                logger.error(f"Error during reconnection attempt for guild {guild_id}: {e}")
+        else:
+            logger.warning(f"No last known channel for guild {guild_id}, cannot attempt reconnection")
+            
+    except Exception as e:
+        logger.error(f"Error in delayed reconnection attempt for guild {guild_id}: {e}")
+
+async def play_next_from_queue(guild_id):
+    """Play the next song from the queue for a specific guild"""
+    try:
+        guild_id_str = str(guild_id)
+        if guild_id_str in queues and queues[guild_id_str]:
+            # Get the next song from the queue
+            next_song = queues[guild_id_str].popleft()
+            logger.info(f"Playing next song from queue for guild {guild_id}: {next_song}")
+            
+            # Create a fake context for playing
+            guild = bot.get_guild(guild_id)
+            if guild:
+                text_channel = next((ch for ch in guild.text_channels if ch.permissions_for(guild.me).send_messages), None)
+                if text_channel:
+                    fake_ctx = await bot.get_context(await text_channel.fetch_message(text_channel.last_message_id) if text_channel.last_message_id else None)
+                    fake_ctx.guild = guild
+                    
+                    # Try to play the song
+                    await handle_play_request(fake_ctx, next_song)
+                    
+    except Exception as e:
+        logger.error(f"Error playing next song from queue for guild {guild_id}: {e}")
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Handle voice state updates to clean up when the bot is disconnected."""
+    try:
+        guild_id = None
+        
+        # Check if the bot was disconnected
+        if member.id == bot.user.id:
+            if before.channel and not after.channel:
+                guild_id = before.channel.guild.id
+                logger.info(f"Bot disconnected from voice channel in guild {guild_id}")
+                
+                # Store the channel for potential reconnection
+                last_voice_channel[guild_id] = before.channel
+                
+                # Clean up resources
+                if guild_id in current_song and current_song[guild_id]:
+                    logger.info(f"Cleaning up current song in guild {guild_id}")
+                    current_song[guild_id].cleanup()
+                    current_song[guild_id] = None
+                    
+                if guild_id in preloaded_songs and preloaded_songs[guild_id]:
+                    logger.info(f"Cleaning up preloaded song in guild {guild_id}")
+                    preloaded_songs[guild_id].cleanup()
+                    preloaded_songs[guild_id] = None
+                    
+                # Reset the playing lock
+                if guild_id in playing_locks:
+                    logger.info(f"Resetting playing lock in guild {guild_id}")
+                    playing_locks[guild_id] = False
+                
+                # Try to reconnect and continue playback if there's a queue
+                if guild_id in queues and queues[str(guild_id)] and len(queues[str(guild_id)]) > 0:
+                    logger.info(f"Queue exists for guild {guild_id}, attempting reconnection")
+                    
+                    # Create a fake context for reconnection
+                    guild = bot.get_guild(guild_id)
+                    if guild:
+                        # Get any text channel to create a fake context
+                        text_channel = next((ch for ch in guild.text_channels if ch.permissions_for(guild.me).send_messages), None)
+                        if text_channel:
+                            fake_ctx = await bot.get_context(await text_channel.fetch_message(text_channel.last_message_id) if text_channel.last_message_id else None)
+                            fake_ctx.guild = guild
+                            # We can't directly assign to fake_ctx.voice_client, but we can work with the guild's voice client
+                            
+                            # Attempt reconnection after a short delay
+                            asyncio.create_task(reconnect_and_resume(fake_ctx))
+            elif after.channel and not before.channel:
+                # Bot connected to a new channel
+                guild_id = after.channel.guild.id
+                last_voice_channel[guild_id] = after.channel
+                logger.info(f"Bot connected to voice channel {after.channel.name} in guild {guild_id}")
+    except Exception as e:
+        logger.error(f"Error in voice state update handler: {e}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+
 # Simplified YouTube options
 default_youtube_options = {
     'format': 'bestaudio/best',
@@ -587,24 +1033,84 @@ async def join(ctx):
     logger.info(f"Joining voice channel {channel.name} in guild {ctx.guild.id}")
     
     # Add retry logic for voice connection with proper error handling
-    max_retries = 3
+    max_retries = 5  # Increased from 3 to 5
     for attempt in range(max_retries):
         try:
-            await channel.connect()
+            # Use a timeout for voice connection to prevent hanging with specific parameters
+            voice_client = await asyncio.wait_for(
+                channel.connect(timeout=30, reconnect=False, cls=discord.VoiceClient), 
+                timeout=15.0
+            )
+            logger.info(f"Successfully connected to voice channel {channel.name} in guild {ctx.guild.id}")
             break
         except IndexError as e:
             if "list index out of range" in str(e) and attempt < max_retries - 1:
                 logger.warning(f"Voice connection attempt {attempt + 1} failed with IndexError (empty modes array), retrying...")
-                await asyncio.sleep(1)  # Brief delay before retry
+                await asyncio.sleep(2)  # Increased delay
                 continue
             else:
                 logger.error(f"Voice connection failed after {max_retries} attempts: {e}")
                 await ctx.send("Failed to connect to voice channel. Discord voice servers may be experiencing issues. Please try again later.")
                 return
+        except discord.errors.ConnectionClosed as e:
+            # Handle specific Discord voice connection errors using the new error handler
+            await handle_voice_connection_error(ctx.guild.id, e, f"join_attempt_{attempt + 1}")
+            
+            error_code = getattr(e, 'code', None)
+            if error_code == 4006:
+                logger.warning(f"Voice connection attempt {attempt + 1} failed with error 4006 (session ended), retrying...")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(3)  # Longer delay for 4006 errors
+                    continue
+                else:
+                    logger.error(f"Voice connection failed after {max_retries} attempts due to error 4006")
+                    await ctx.send("Failed to connect to voice channel due to session issues. Please try again in a few moments.")
+                    return
+            elif error_code == 1000:
+                logger.warning(f"Voice connection attempt {attempt + 1} failed with error 1000 (normal closure), retrying...")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2)  # Delay for 1000 errors
+                    continue
+                else:
+                    logger.error(f"Voice connection failed after {max_retries} attempts due to error 1000")
+                    await ctx.send("Failed to connect to voice channel due to normal closure. Please try again in a few moments.")
+                    return
+            else:
+                logger.error(f"Discord connection closed during voice connection attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2)
+                    continue
+                else:
+                    await ctx.send("Failed to connect to voice channel due to Discord connection issues. Please try again later.")
+                    return
+        except discord.errors.ClientException as e:
+            if "Already connected to a voice channel" in str(e):
+                logger.info(f"Already connected to voice channel in guild {ctx.guild.id}")
+                break
+            else:
+                logger.error(f"Client exception during voice connection attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2)
+                    continue
+                else:
+                    await ctx.send(f"Failed to connect to voice channel: {e}")
+                    return
+        except asyncio.TimeoutError:
+            logger.error(f"Voice connection attempt {attempt + 1} timed out")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(3)
+                continue
+            else:
+                await ctx.send("Failed to connect to voice channel: Connection timed out. Please try again.")
+                return
         except Exception as e:
-            logger.error(f"Unexpected error during voice connection: {e}")
-            await ctx.send(f"Failed to connect to voice channel: {e}")
-            return
+            logger.error(f"Unexpected error during voice connection attempt {attempt + 1}: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2)
+                continue
+            else:
+                await ctx.send(f"Failed to connect to voice channel: {e}")
+                return
     
     # Store the channel for reconnection purposes
     last_voice_channel[ctx.guild.id] = channel
@@ -759,7 +1265,8 @@ async def handle_play_request(ctx, search: str):
                 elif ctx.guild.voice_client and ctx.guild.voice_client.is_connected():
                     # Discord API state issue workaround
                     logger.info(f"Using guild voice client as fallback for guild {guild_id_str}")
-                    ctx.voice_client = ctx.guild.voice_client
+                    # We can't directly assign to ctx.voice_client, but we can work with the guild's voice client
+                    # The context will automatically use the guild's voice client
                     voice_client_ready = True
                 
                 if not voice_client_ready:
@@ -777,26 +1284,55 @@ async def handle_play_request(ctx, search: str):
                             except:
                                 pass
                     
-                    # Clear the context
-                    ctx.voice_client = None
+                    # Clear the context - we can't directly assign to ctx.voice_client
+                    # Instead, we'll work with the guild's voice client directly
                     
                     # Wait a moment for Discord to process the disconnect
                     await asyncio.sleep(2)
                     
-                    # Try to reconnect using the join function directly
+                    # Try to reconnect using the join function directly with enhanced error handling
                     if guild_id in last_voice_channel:
                         channel = last_voice_channel[guild_id]
-                        try:
-                            logger.info(f"Attempting clean reconnection to {channel.name} for guild {guild_id_str}")
-                            voice_client = await channel.connect()
-                            if voice_client and voice_client.is_connected():
-                                ctx.voice_client = voice_client
-                                logger.info(f"Successfully reconnected after force disconnect for guild {guild_id_str}")
-                                voice_client_ready = True
-                            else:
-                                logger.error(f"Clean reconnection failed for guild {guild_id_str}")
-                        except Exception as e:
-                            logger.error(f"Clean reconnection error for guild {guild_id_str}: {e}")
+                        max_reconnect_attempts = 3
+                        for reconnect_attempt in range(max_reconnect_attempts):
+                            try:
+                                logger.info(f"Attempting clean reconnection to {channel.name} for guild {guild_id_str} (attempt {reconnect_attempt + 1})")
+                                voice_client = await asyncio.wait_for(
+                                    channel.connect(timeout=30, reconnect=False, cls=discord.VoiceClient), 
+                                    timeout=15.0
+                                )
+                                if voice_client and voice_client.is_connected():
+                                    # We can't directly assign to ctx.voice_client, but we can work with the guild's voice client
+                                    # The context will automatically use the guild's voice client
+                                    logger.info(f"Successfully reconnected after force disconnect for guild {guild_id_str}")
+                                    voice_client_ready = True
+                                    break
+                                else:
+                                    logger.error(f"Clean reconnection failed for guild {guild_id_str}")
+                            except discord.errors.ConnectionClosed as e:
+                                error_code = getattr(e, 'code', None)
+                                if error_code == 4006:
+                                    logger.warning(f"Reconnection attempt {reconnect_attempt + 1} failed with error 4006 for guild {guild_id_str}")
+                                    if reconnect_attempt < max_reconnect_attempts - 1:
+                                        await asyncio.sleep(3)  # Longer delay for 4006 errors
+                                        continue
+                                    else:
+                                        logger.error(f"Failed to reconnect after {max_reconnect_attempts} attempts due to error 4006")
+                                        break
+                                else:
+                                    logger.error(f"Discord connection closed during reconnection attempt {reconnect_attempt + 1}: {e}")
+                                    if reconnect_attempt < max_reconnect_attempts - 1:
+                                        await asyncio.sleep(2)
+                                        continue
+                                    else:
+                                        break
+                            except Exception as e:
+                                logger.error(f"Clean reconnection error for guild {guild_id_str} (attempt {reconnect_attempt + 1}): {e}")
+                                if reconnect_attempt < max_reconnect_attempts - 1:
+                                    await asyncio.sleep(2)
+                                    continue
+                                else:
+                                    break
                     
                     if not voice_client_ready:
                         logger.error(f"Cannot establish voice connection for guild {guild_id_str}")
@@ -1646,8 +2182,7 @@ async def ensure_voice_connection(ctx, max_retries=3):
     
     # Check if guild has a voice client we can use
     if ctx.guild.voice_client and ctx.guild.voice_client.is_connected():
-        logger.info(f"Found existing guild voice client for guild {guild_id}, updating context")
-        ctx.voice_client = ctx.guild.voice_client
+        logger.info(f"Found existing guild voice client for guild {guild_id}, context will use it automatically")
         return True
     
     # Try to reconnect to the last known channel
@@ -1665,7 +2200,7 @@ async def ensure_voice_connection(ctx, max_retries=3):
             if ctx.voice_client and not ctx.voice_client.is_connected():
                 try:
                     await ctx.voice_client.disconnect()
-                    ctx.voice_client = None
+                    # We can't directly assign to ctx.voice_client, but the disconnect will clear the connection
                 except:
                     pass
             
@@ -1676,21 +2211,52 @@ async def ensure_voice_connection(ctx, max_retries=3):
                 except:
                     pass
             
-            # Try to connect with IndexError retry built-in
+            # Try to connect with enhanced error handling
             voice_client = None
             connection_retries = 3
             for conn_attempt in range(connection_retries):
                 try:
-                    voice_client = await channel.connect()
+                    voice_client = await asyncio.wait_for(
+                        channel.connect(timeout=30, reconnect=False, cls=discord.VoiceClient), 
+                        timeout=15.0
+                    )
                     break
                 except IndexError as e:
                     if "list index out of range" in str(e) and conn_attempt < connection_retries - 1:
                         logger.warning(f"Voice connection attempt {conn_attempt + 1} failed with IndexError (empty modes array), retrying...")
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(2)  # Increased delay
                         continue
                     else:
                         logger.error(f"Voice connection failed after {connection_retries} IndexError retries")
                         raise e
+                except discord.errors.ConnectionClosed as e:
+                    # Handle specific Discord voice connection errors using the new error handler
+                    await handle_voice_connection_error(guild_id, e, f"connection_attempt_{conn_attempt + 1}")
+                    
+                    error_code = getattr(e, 'code', None)
+                    if error_code == 4006:
+                        logger.warning(f"Voice connection attempt {conn_attempt + 1} failed with error 4006 (session ended), retrying...")
+                        if conn_attempt < connection_retries - 1:
+                            await asyncio.sleep(3)  # Longer delay for 4006 errors
+                            continue
+                        else:
+                            logger.error(f"Voice connection failed after {connection_retries} attempts due to error 4006")
+                            raise e
+                    elif error_code == 1000:
+                        logger.warning(f"Voice connection attempt {conn_attempt + 1} failed with error 1000 (normal closure), retrying...")
+                        if conn_attempt < connection_retries - 1:
+                            await asyncio.sleep(2)  # Delay for 1000 errors
+                            continue
+                        else:
+                            logger.error(f"Voice connection failed after {connection_retries} attempts due to error 1000")
+                            raise e
+                    else:
+                        logger.error(f"Discord connection closed during voice connection attempt {conn_attempt + 1}: {e}")
+                        if conn_attempt < connection_retries - 1:
+                            await asyncio.sleep(2)
+                            continue
+                        else:
+                            raise e
                 except discord.errors.ClientException as e:
                     if "Already connected to a voice channel" in str(e):
                         # Check if we can find the existing connection
@@ -1702,17 +2268,31 @@ async def ensure_voice_connection(ctx, max_retries=3):
                             logger.warning(f"'Already connected' but no valid client found, this may indicate a state issue")
                             raise e
                     else:
-                        raise e
+                        logger.error(f"Client exception during voice connection attempt {conn_attempt + 1}: {e}")
+                        if conn_attempt < connection_retries - 1:
+                            await asyncio.sleep(2)
+                            continue
+                        else:
+                            raise e
             
             if voice_client and voice_client.is_connected():
                 logger.info(f"Successfully connected to voice channel in guild {guild_id}")
-                ctx.voice_client = voice_client
+                # We can't directly assign to ctx.voice_client, but the connection will be available through the guild
                 return True
             else:
                 logger.warning(f"Voice connection attempt {attempt + 1} failed - no valid client obtained")
                 
         except discord.errors.ConnectionClosed as e:
-            logger.warning(f"Discord connection closed during reconnection attempt {attempt + 1} for guild {guild_id}: {e}")
+            # Use the new error handler for better error management
+            await handle_voice_connection_error(guild_id, e, f"reconnection_attempt_{attempt + 1}")
+            
+            error_code = getattr(e, 'code', None)
+            if error_code == 4006:
+                logger.warning(f"Discord connection closed with error 4006 during reconnection attempt {attempt + 1} for guild {guild_id}")
+            elif error_code == 1000:
+                logger.warning(f"Discord connection closed with error 1000 (normal closure) during reconnection attempt {attempt + 1} for guild {guild_id}")
+            else:
+                logger.warning(f"Discord connection closed during reconnection attempt {attempt + 1} for guild {guild_id}: {e}")
         except Exception as e:
             logger.warning(f"Voice reconnection attempt {attempt + 1} failed for guild {guild_id}: {e}")
             
@@ -1764,7 +2344,7 @@ async def on_voice_state_update(member, before, after):
                     if text_channel:
                         fake_ctx = await bot.get_context(await text_channel.fetch_message(text_channel.last_message_id) if text_channel.last_message_id else None)
                         fake_ctx.guild = guild
-                        fake_ctx.voice_client = None
+                        # We can't directly assign to fake_ctx.voice_client, but we can work with the guild's voice client
                         
                         # Attempt reconnection after a short delay
                         asyncio.create_task(reconnect_and_resume(fake_ctx))
@@ -3033,4 +3613,67 @@ def _after_tts(error, filename, resume_after, voice_client):
             os.remove(filename)
     except Exception as e:
         logger.error(f"Error removing TTS file {filename}: {e}")
+
+@bot.command()
+async def voice_debug(ctx):
+    """Shows detailed debug information about voice connection status."""
+    logger.info(f"Voice debug command used by {ctx.author} in guild {ctx.guild.id}")
+    
+    guild_id = ctx.guild.id
+    
+    # Create an embed for voice debug information
+    embed = discord.Embed(title="🔊 Voice Connection Debug", color=discord.Color.blue())
+    
+    # Voice client status
+    if ctx.voice_client:
+        embed.add_field(name="Voice Client Status", value=f"Connected: {ctx.voice_client.is_connected()}\nPlaying: {ctx.voice_client.is_playing()}\nPaused: {ctx.voice_client.is_paused()}\nChannel: {ctx.voice_client.channel.name if ctx.voice_client.channel else 'None'}", inline=False)
+    else:
+        embed.add_field(name="Voice Client Status", value="Not connected", inline=False)
+    
+    # Guild voice client status
+    if ctx.guild.voice_client:
+        embed.add_field(name="Guild Voice Client", value=f"Connected: {ctx.guild.voice_client.is_connected()}\nChannel: {ctx.guild.voice_client.channel.name if ctx.guild.voice_client.channel else 'None'}", inline=False)
+    else:
+        embed.add_field(name="Guild Voice Client", value="Not connected", inline=False)
+    
+    # Last known voice channel
+    if guild_id in last_voice_channel:
+        embed.add_field(name="Last Known Channel", value=f"Name: {last_voice_channel[guild_id].name}\nID: {last_voice_channel[guild_id].id}", inline=False)
+    else:
+        embed.add_field(name="Last Known Channel", value="None stored", inline=False)
+    
+    # User's voice status
+    if ctx.author.voice:
+        embed.add_field(name="Your Voice Status", value=f"Connected: Yes\nChannel: {ctx.author.voice.channel.name}\nMembers: {len(ctx.author.voice.channel.members)}", inline=False)
+    else:
+        embed.add_field(name="Your Voice Status", value="Not connected to voice", inline=False)
+    
+    # Available voice channels
+    voice_channels = []
+    for vc in ctx.guild.voice_channels:
+        member_count = len(vc.members)
+        has_bot = any(member.id == bot.user.id for member in vc.members)
+        voice_channels.append(f"• {vc.name} ({member_count} members{' - Bot here' if has_bot else ''})")
+    
+    if voice_channels:
+        embed.add_field(name="Available Voice Channels", value="\n".join(voice_channels), inline=False)
+    else:
+        embed.add_field(name="Available Voice Channels", value="None found", inline=False)
+    
+    # Connection troubleshooting tips
+    tips = []
+    if not ctx.voice_client:
+        tips.append("• Use `!join` to connect to your current voice channel")
+    if ctx.author.voice and not ctx.voice_client:
+        tips.append("• Make sure you're in a voice channel before using `!join`")
+    if ctx.voice_client and not ctx.voice_client.is_connected():
+        tips.append("• Voice connection appears broken, try `!join` again")
+    if not tips:
+        tips.append("• Voice connection appears healthy")
+    
+    embed.add_field(name="Troubleshooting Tips", value="\n".join(tips), inline=False)
+    
+    await ctx.send(embed=embed)
+
+
 
