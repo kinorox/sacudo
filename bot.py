@@ -14,9 +14,38 @@ import traceback
 import atexit
 import threading
 import time
-from flask import Flask, request, jsonify, send_from_directory
-from flask_cors import CORS
-from flask_socketio import SocketIO, join_room, leave_room
+try:
+    from flask import Flask, request, jsonify, send_from_directory
+    from flask_cors import CORS
+    from flask_socketio import SocketIO, join_room, leave_room
+    API_AVAILABLE = True
+except Exception:
+    # Dashboard/API not used; provide dummies so decorators and calls no-op
+    API_AVAILABLE = False
+
+    class _DummyApp:
+        def route(self, *args, **kwargs):
+            def _decorator(func):
+                return func
+            return _decorator
+
+    class _DummySocketIO:
+        def on(self, *args, **kwargs):
+            def _decorator(func):
+                return func
+            return _decorator
+        def emit(self, *args, **kwargs):
+            return None
+
+    # Dummies used by the rest of the file if referenced
+    Flask = _DummyApp  # type: ignore
+    SocketIO = _DummySocketIO  # type: ignore
+    def CORS(*args, **kwargs):
+        return None
+    def join_room(*args, **kwargs):
+        return None
+    def leave_room(*args, **kwargs):
+        return None
 
 import aiohttp
 import uuid
@@ -76,6 +105,8 @@ current_song_message = {}  # Stores the last sent bot message per guild
 song_cache = {}  # Cache for song information to avoid re-fetching
 preloaded_songs = {}  # Store preloaded songs for each guild
 playing_locks = {}  # Locks to prevent multiple songs from playing simultaneously
+playback_tasks = {}
+playback_task_locks = {}
 
 # Configure intents
 intents = discord.Intents.default()
@@ -136,6 +167,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
         }]
         self._start_time = None
         self._process = None  # Store the FFmpeg process
+        self.file_path = None  # Local downloaded file path for cleanup
 
     @staticmethod
     def is_url(text):
@@ -170,7 +202,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
         else:
             url = url_or_search
             
-        logger.info(f"Creating source from URL: {url} (stream={stream})")
+        logger.info(f"Creating source from URL: {url} (streaming)")
         
         # Check if we have the song in cache
         if url in song_cache:
@@ -193,27 +225,26 @@ class YTDLSource(discord.PCMVolumeTransformer):
             # but we can use the cache for displaying metadata
             logger.info(f"Cached URL is not direct. Re-extracting for {url}")
         
-        # Use simplified options
-        ydl_opts = default_youtube_options.copy()
-        
-        # Add specific options based on URL type
+        # Streaming-only options (no downloads, no disk usage)
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'ignoreerrors': True,
+            'noplaylist': True,
+            'format': 'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best',
+            'skip_download': True,  # Don't download, just get streaming URL
+            'retries': 3,
+            'socket_timeout': 30,
+            'extractor_retries': 3,
+        }
+        # If it's a search, allow ytsearch and then download first result
         if url.startswith('ytsearch:'):
-            logger.info(f"Using search options")
-            ydl_opts.update({
-                'default_search': 'auto',
-                'ignoreerrors': False,  # We want to catch errors for search queries
-            })
-        else:
-            logger.info(f"Using direct URL options")
-            ydl_opts.update({
-                'ignoreerrors': True,
-                'skip_download': True,  # Important: just streaming, not downloading
-            })
+            ydl_opts.update({'default_search': 'auto'})
         
         try:
             with YoutubeDL(ydl_opts) as ydl:
-                logger.info(f"Extracting info for URL: {url}")
-                data = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=not stream))
+                logger.info(f"Extracting streaming info for URL: {url}")
+                data = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=False))
 
             if data is None:
                 logger.error(f"Failed to extract info for URL: {url}")
@@ -231,7 +262,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
                         logger.error(f"No search results found for: {url}")
                         raise YTDLError(f"No results found for search query")
                 else:
-                    logger.info(f"URL is a playlist, using first entry: {url}")
+                    logger.info(f"Entries found; selecting first entry for download")
                     data = data['entries'][0]
                 
                 # Check if the entry is valid
@@ -242,8 +273,10 @@ class YTDLSource(discord.PCMVolumeTransformer):
             logger.error(f"Error extracting info for URL {url}: {str(e)}")
             logger.error(traceback.format_exc())
             
-            # Check if this is a format error and we can retry with a different format
+            # Check for specific error types and handle them
             error_msg = str(e).lower()
+            
+            # Check if this is a format error and we can retry with a different format
             if ("format" in error_msg or "requested format is not available" in error_msg) and retry_count < 2:
                 logger.info(f"Format error detected for URL {url}, retrying with different format (retry: {retry_count+1})")
                 # Try again with a different format
@@ -251,29 +284,25 @@ class YTDLSource(discord.PCMVolumeTransformer):
             
             raise YTDLError(f"Error extracting info: {str(e)}")
 
-        filename = data['url'] if stream else ydl.prepare_filename(data)
-        
-        # Get the streaming URL from the data
-        if 'url' in data:
-            filename = data['url']  # Direct URL to the audio stream
-            logger.info(f"Using direct URL from data for streaming")
-        else:
-            filename = data.get('webpage_url', url)  # Fallback to webpage URL or original URL
-            logger.warning(f"No direct URL found, using webpage URL: {filename}")
-        
+        # Get streaming URL (no file downloads)
+        filename = data.get('url')
+        if not filename:
+            filename = data.get('webpage_url', url)
+            logger.warning(f"No direct streaming URL found, using webpage URL: {filename}")
+
         # Update the player URL if it wasn't set
         if not data.get('webpage_url') and url.startswith('ytsearch:'):
             data['webpage_url'] = data.get('url', filename)
             logger.info(f"Setting webpage_url for search result: {data.get('webpage_url')}")
-        
+
         # Cache the data for future use
         song_cache[url] = data
-        logger.info(f"Cached data for URL: {url}")
-        
+        logger.info(f"Cached streaming data for URL: {url}")
+
         # Log important data for debugging
-        logger.info(f"Title: {data.get('title')}, URL: {data.get('webpage_url')}, Stream URL: {filename}")
-        
-        # Create the audio source with proper FFmpeg options
+        logger.info(f"Title: {data.get('title')}, Streaming URL: {filename}")
+
+        # Create the audio source with streaming options
         audio_source = discord.FFmpegPCMAudio(
             filename,
             before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
@@ -283,11 +312,12 @@ class YTDLSource(discord.PCMVolumeTransformer):
         # Add a small delay to ensure the source is properly initialized
         await asyncio.sleep(0.5)
         
-        logger.info(f"Created YTDLSource for URL: {url}, title: {data.get('title')}")
+        logger.info(f"Created streaming YTDLSource for URL: {url}, title: {data.get('title')}")
         # Ensure volume is set at a good audible level
         source = cls(audio_source, data=data)
         source.volume = 0.8  # Set a slightly higher volume to ensure audibility
         return source
+    
         
     def cleanup(self):
         """Clean up resources when the source is done."""
@@ -299,6 +329,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
             except Exception as e:
                 logger.error(f"Error cleaning up FFmpeg process: {e}")
                 logger.error(traceback.format_exc())
+        # No file cleanup needed for streaming mode
                 
     def __del__(self):
         """Ensure cleanup happens when the object is garbage collected."""
@@ -357,7 +388,7 @@ async def handle_skip_request(ctx):
             next_song_title = "Next song in queue"
             logger.info(f"Next song URL: {next_url} (title not in cache)")
     
-    # Stop current playback - this will trigger play_next which handles playing the next song
+    # Stop current playback; worker will proceed to next item
     ctx.voice_client.stop()
     logger.info(f"Stopped current song for skip in guild {guild_id_str}")
     
@@ -1253,7 +1284,7 @@ async def handle_play_request(ctx, search: str):
                 if not YTDLSource.is_url(search):
                     await ctx.send(f"🔍 Searching YouTube for: '{search}'...")
                     
-                player = await YTDLSource.from_url(search, loop=bot.loop, stream=True)
+                player = await YTDLSource.from_url(search, loop=bot.loop, stream=False)
                 
                 # Add a small delay to ensure buffer is filled
                 await asyncio.sleep(0.5)
@@ -1339,7 +1370,13 @@ async def handle_play_request(ctx, search: str):
                         return f"Error: Cannot establish voice connection due to Discord API issues. Try using the !join command first."
                 
                 logger.info(f"Playing: {player.title}")
-                ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop) if e is None else logger.error(f"Audio playback error: {e}"))
+                ctx.voice_client.play(
+                    player,
+                    after=lambda e, p=player: (
+                        p.cleanup(),
+                        asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
+                    ) if e is None else logger.error(f"Audio playback error: {e}")
+                )
                 
                 # Set the current song and log it
                 current_song[guild_id_str] = player
@@ -1685,7 +1722,7 @@ async def play_next(ctx):
                 
                 # Create the player for the next song
                 logger.info(f"Creating player for next song in guild {guild_id_str}")
-                player = await YTDLSource.from_url(next_url, loop=bot.loop, stream=True)
+                player = await YTDLSource.from_url(next_url, loop=bot.loop, stream=False)
                 
                 # Ensure we have a stable voice connection
                 if not await ensure_voice_connection(ctx):
@@ -1714,7 +1751,13 @@ async def play_next(ctx):
                 
                 # Play the next song
                 logger.info(f"Playing next song in guild {guild_id_str}: {player.title}")
-                ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop) if e is None else logger.error(f"Audio playback error: {e}"))
+                ctx.voice_client.play(
+                    player,
+                    after=lambda e, p=player: (
+                        p.cleanup(),
+                        asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
+                    ) if e is None else logger.error(f"Audio playback error: {e}")
+                )
                 current_song[guild_id_str] = player
                 logger.info(f"Set current_song[{guild_id_str}] to {player.title} (from queue)")
                 
@@ -1887,7 +1930,7 @@ async def preload_next_song(ctx):
         logger.info(f"Preloading song: {next_url} for guild {guild_id_str}")
         try:
             # Preload the song
-            player = await YTDLSource.from_url(next_url, loop=bot.loop, stream=True)
+            player = await YTDLSource.from_url(next_url, loop=bot.loop, stream=False)
             
             # Double check that this isn't the currently playing song
             if current_song_obj and current_song_obj.title == player.title:
@@ -2020,41 +2063,9 @@ async def handle_playlist(ctx, url):
         'action': 'add_playlist'
     })
     
-    # If the bot is not already playing, start playing the first song
+    # If the bot is not already playing, trigger the queue-driven playback
     if not ctx.voice_client or not ctx.voice_client.is_playing():
-        # Ensure queue has items before trying to play
-        if queues.get(guild_id_str):
-            first_url = queues[guild_id_str].popleft()
-            logger.info(f"Playing first song from playlist: {first_url} for guild {guild_id_str}")
-            try:
-                player = await YTDLSource.from_url(first_url, loop=bot.loop, stream=True)
-                
-                # Add a small delay to ensure buffer is filled
-                await asyncio.sleep(0.5)
-                
-                logger.info(f"Playing first song from playlist: {player.title} for guild {guild_id_str}")
-                ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop) if e is None else logger.error(f"Audio playback error: {e}"))
-                current_song[guild_id_str] = player
-                
-                await update_music_message(ctx, player)
-                await ctx.send(f"🎵 Playing playlist. Added {len(queues[guild_id_str])} songs to the queue.")
-                
-                # Emit song update for dashboard
-                emit_to_guild(guild_id, 'song_update', {
-                    'guild_id': guild_id_str,
-                    'current_song': song_to_dict(player),
-                    'action': 'play'
-                })
-                
-            except Exception as e:
-                logger.error(f"Error playing first song from playlist in guild {guild_id_str}: {e}")
-                logger.error(traceback.format_exc())
-                await ctx.send(f"❌ Error playing the first song from the playlist: {str(e)}")
-                # Try to play the next song if possible
-                asyncio.create_task(play_next(ctx))
-        else:
-            logger.warning(f"Queue for guild {guild_id_str} is empty after trying to play the first song.")
-            await ctx.send("❌ Queue is empty after processing the playlist.")
+        await play_next(ctx)
     else:
         # If already playing, just add to queue
         logger.info(f"Bot already playing, added {added_count} songs from playlist to queue for guild {guild_id_str}")

@@ -99,24 +99,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  sacudo                      # Run bot only
-  sacudo --with-api           # Run bot with API backend
-  sacudo --with-dashboard     # Run bot, API, and React dashboard
+  sacudo                      # Run bot
   sacudo --help               # Show this help message
         """
     )
     
-    parser.add_argument(
-        "--with-api",
-        action="store_true",
-        help="Run the bot with web dashboard API (default: bot only)"
-    )
-    
-    parser.add_argument(
-        "--with-dashboard",
-        action="store_true", 
-        help="Run bot with API and React dashboard (requires Node.js)"
-    )
+    # Dashboard/API removed for a minimal bot experience
     
     parser.add_argument(
         "--version",
@@ -126,9 +114,7 @@ Examples:
     
     args = parser.parse_args()
     
-    # Handle mutually exclusive options - prefer --with-dashboard over --with-api
-    if args.with_dashboard:
-        args.with_api = True  # Dashboard requires API
+    # No dashboard/API modes
     
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
@@ -146,62 +132,15 @@ Examples:
             print("BOT_TOKEN=your_discord_bot_token_here")
             sys.exit(1)
         
-        # Check Node.js if dashboard is requested
-        if args.with_dashboard and not check_node_installed():
-            print("❌ Error: Node.js is not installed or not available in PATH!")
-            print("Please install Node.js from https://nodejs.org/ to use the dashboard.")
-            sys.exit(1)
-        
         # Set up sys.argv for the bot module
-        if args.with_api:
-            sys.argv = ["sacudo", "--with-api"]
-        else:
-            sys.argv = ["sacudo"]
+        sys.argv = ["sacudo"]
         
         print("🎵 Starting Sacudo Discord Bot...")
-        if args.with_dashboard:
-            print("🌐 API will be available at http://localhost:8000")
-            print("🎨 React dashboard will be available at http://localhost:3000")
-        elif args.with_api:
-            print("🌐 Web dashboard API will be available at http://localhost:8000")
+        # Dashboard/API removed
         
         # Run the bot
-        if args.with_api:
-            # Start dashboard if requested
-            if args.with_dashboard:
-                if not start_dashboard():
-                    print("❌ Failed to start dashboard, continuing with bot and API only...")
-                else:
-                    # Give the dashboard a moment to start
-                    time.sleep(2)
-            
-            # Start the bot in a separate thread
-            bot_thread = threading.Thread(target=bot.run_bot)
-            bot_thread.daemon = True
-            bot_thread.start()
-            
-            # Create PID file
-            bot.create_pid_file()
-            try:
-                # Start the Flask server
-                bot.logger.info("Starting web server")
-                bot.socketio.run(
-                    bot.app, 
-                    host='0.0.0.0', 
-                    port=bot.API_PORT,
-                    debug=True,
-                    allow_unsafe_werkzeug=True, 
-                    log_output=True,
-                    use_reloader=False
-                )
-            finally:
-                # Remove PID file on shutdown
-                bot.remove_pid_file()
-                # Cleanup dashboard process
-                cleanup_processes()
-        else:
-            # Run in standalone bot mode
-            bot.run_bot()
+        # Run the bot
+        bot.run_bot()
             
     except KeyboardInterrupt:
         print("\n👋 Shutting down Sacudo...")
