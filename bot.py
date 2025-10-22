@@ -215,7 +215,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
                 # Create the audio source with proper FFmpeg options
                 audio_source = discord.FFmpegPCMAudio(
                     filename,
-                    before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+                    before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"',
                     options='-vn -ar 48000 -ac 2 -b:a 128k -f s16le'
                 )
                 source = cls(audio_source, data=data)
@@ -231,11 +231,14 @@ class YTDLSource(discord.PCMVolumeTransformer):
             'no_warnings': True,
             'ignoreerrors': True,
             'noplaylist': True,
-            'format': 'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best',
+            'format': 'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio[acodec!=none]/bestaudio/best',
             'skip_download': True,  # Don't download, just get streaming URL
             'retries': 3,
             'socket_timeout': 30,
             'extractor_retries': 3,
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
         }
         # If it's a search, allow ytsearch and then download first result
         if url.startswith('ytsearch:'):
@@ -305,7 +308,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
         # Create the audio source with streaming options
         audio_source = discord.FFmpegPCMAudio(
             filename,
-            before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+            before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"',
             options='-vn -ar 48000 -ac 2 -b:a 128k -f s16le'
         )
         
@@ -316,6 +319,33 @@ class YTDLSource(discord.PCMVolumeTransformer):
         # Ensure volume is set at a good audible level
         source = cls(audio_source, data=data)
         source.volume = 0.8  # Set a slightly higher volume to ensure audibility
+        
+        # Test the source to make sure it's valid
+        try:
+            # Check if the source is readable
+            if hasattr(audio_source, 'read'):
+                logger.info(f"Audio source is readable for {data.get('title')}")
+                # Try to read a small amount to test
+                try:
+                    test_read = audio_source.read(1024)
+                    if test_read:
+                        logger.info(f"Successfully read {len(test_read)} bytes from audio source")
+                    else:
+                        logger.warning(f"Audio source returned empty data")
+                except Exception as read_error:
+                    logger.error(f"Error reading from audio source: {read_error}")
+            else:
+                logger.warning(f"Audio source may not be readable for {data.get('title')}")
+                
+            # Check if the source has a process attribute
+            if hasattr(audio_source, 'process'):
+                logger.info(f"Audio source has process: {audio_source.process}")
+            else:
+                logger.info(f"Audio source does not have process attribute")
+                
+        except Exception as e:
+            logger.error(f"Error testing audio source: {e}")
+            
         return source
     
         
@@ -1292,7 +1322,9 @@ async def handle_play_request(ctx, search: str):
                 # Verify connection before playing - handle Discord API state issues
                 voice_client_ready = False
                 if ctx.voice_client and ctx.voice_client.is_connected():
+                    # Simple check - if is_connected() returns True, we're good
                     voice_client_ready = True
+                    logger.info(f"Voice client is connected for guild {guild_id_str}")
                 elif ctx.guild.voice_client and ctx.guild.voice_client.is_connected():
                     # Discord API state issue workaround
                     logger.info(f"Using guild voice client as fallback for guild {guild_id_str}")
@@ -1370,13 +1402,28 @@ async def handle_play_request(ctx, search: str):
                         return f"Error: Cannot establish voice connection due to Discord API issues. Try using the !join command first."
                 
                 logger.info(f"Playing: {player.title}")
-                ctx.voice_client.play(
-                    player,
-                    after=lambda e, p=player: (
-                        p.cleanup(),
+                def after_callback(error):
+                    """Handle the after callback with better error handling"""
+                    if error:
+                        logger.error(f"Audio playback error for {player.title}: {error}")
+                        logger.error(f"Error type: {type(error).__name__}")
+                        logger.error(f"Error details: {str(error)}")
+                        # Only call play_next if it's a real playback error, not a connection issue
+                        if "timeout" not in str(error).lower() and "connection" not in str(error).lower():
+                            player.cleanup()
+                            asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
+                        else:
+                            logger.warning(f"Connection-related error, not calling play_next: {error}")
+                            player.cleanup()
+                    else:
+                        # Song finished normally
+                        logger.info(f"Song finished normally: {player.title}")
+                        player.cleanup()
                         asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
-                    ) if e is None else logger.error(f"Audio playback error: {e}")
-                )
+                
+                # Add a small delay to ensure the source is ready
+                await asyncio.sleep(1.0)
+                ctx.voice_client.play(player, after=after_callback)
                 
                 # Set the current song and log it
                 current_song[guild_id_str] = player
@@ -1594,8 +1641,8 @@ async def play_next(ctx):
         queue_length = await fix_queue(guild_id)
         logger.info(f"Queue length after fixing: {queue_length}")
             
-        # Clear the current song immediately - we'll set it again if we successfully play a new song
-        current_song[guild_id_str] = None
+        # Don't clear the current song immediately - only clear it if we're actually moving to a new song
+        # This prevents the song from being cleared when the after callback is triggered due to connection issues
         
         # Check if we have a preloaded song
         if guild_id in preloaded_songs and preloaded_songs[guild_id]:
@@ -1745,19 +1792,34 @@ async def play_next(ctx):
                     logger.warning(f"Voice client disconnected, attempting reconnection for guild {guild_id_str}")
                     if not await ensure_voice_connection(ctx):
                         logger.error(f"Cannot establish voice connection for next song in guild {guild_id_str}")
-                        # Try again later
+                        # Wait before retrying to avoid infinite loops
+                        await asyncio.sleep(5)
+                        # Try again later with a delay
                         asyncio.create_task(play_next(ctx))
                         return
                 
                 # Play the next song
                 logger.info(f"Playing next song in guild {guild_id_str}: {player.title}")
-                ctx.voice_client.play(
-                    player,
-                    after=lambda e, p=player: (
-                        p.cleanup(),
+                def after_callback_queue(error):
+                    """Handle the after callback for queued songs with better error handling"""
+                    if error:
+                        logger.error(f"Audio playback error: {error}")
+                        # Only call play_next if it's a real playback error, not a connection issue
+                        if "timeout" not in str(error).lower() and "connection" not in str(error).lower():
+                            player.cleanup()
+                            asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
+                        else:
+                            logger.warning(f"Connection-related error, not calling play_next: {error}")
+                            player.cleanup()
+                    else:
+                        # Song finished normally
+                        logger.info(f"Queued song finished normally: {player.title}")
+                        player.cleanup()
                         asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
-                    ) if e is None else logger.error(f"Audio playback error: {e}")
-                )
+                
+                # Add a small delay to ensure the source is ready
+                await asyncio.sleep(1.0)
+                ctx.voice_client.play(player, after=after_callback_queue)
                 current_song[guild_id_str] = player
                 logger.info(f"Set current_song[{guild_id_str}] to {player.title} (from queue)")
                 
@@ -1865,9 +1927,21 @@ async def play_next(ctx):
                 except discord.NotFound:
                     pass
             
-            # Clear the current song
-            current_song[guild_id_str] = None
-            logger.info(f"Cleared current_song[{guild_id_str}]")
+            # Only clear the current song if we're not currently playing the same song
+            # This prevents clearing when the after callback is triggered due to connection issues
+            if guild_id_str in current_song and current_song[guild_id_str]:
+                current_playing = current_song[guild_id_str]
+                # Check if the current song is still the same (not already cleared by another process)
+                if hasattr(current_playing, 'title'):
+                    logger.info(f"Current song is still playing: {current_playing.title}, not clearing it")
+                    # Don't clear the current song if it's still playing
+                    return
+                else:
+                    logger.info(f"Current song object is invalid, clearing it")
+                    current_song[guild_id_str] = None
+            else:
+                logger.info(f"No current song to clear for guild {guild_id_str}")
+                current_song[guild_id_str] = None
             
             # Emit socket events for queue end
             emit_to_guild(guild_id, 'song_update', {
@@ -3557,7 +3631,7 @@ async def download_audio(url, output_path):
         })
 
         # Download the audio
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
         return True
     except Exception as e:
