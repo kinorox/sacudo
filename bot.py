@@ -120,10 +120,17 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 # Configure FFmpeg path for Windows
 import shutil
+import os
 ffmpeg_path = shutil.which('ffmpeg')
 if not ffmpeg_path:
     ffmpeg_path = r'C:\ffmpeg\bin\ffmpeg.exe'
-    
+
+# Verify FFmpeg exists
+if os.path.exists(ffmpeg_path):
+    logger.info(f"FFmpeg found at: {ffmpeg_path}")
+else:
+    logger.error(f"FFmpeg NOT found at: {ffmpeg_path}")
+
 discord.FFmpegPCMAudio.executable = ffmpeg_path
 
 # Add improved voice client settings
@@ -212,11 +219,11 @@ class YTDLSource(discord.PCMVolumeTransformer):
             if 'url' in data:
                 logger.info(f"Using cached URL for {url}")
                 filename = data['url']
-                # Create the audio source with proper FFmpeg options
+                # Create the audio source with simple streaming options
                 audio_source = discord.FFmpegPCMAudio(
                     filename,
-                    before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"',
-                    options='-vn -ar 48000 -ac 2 -b:a 128k -f s16le'
+                    before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+                    options='-vn -ar 48000 -ac 2 -f s16le'
                 )
                 source = cls(audio_source, data=data)
                 source.volume = 0.8
@@ -306,45 +313,49 @@ class YTDLSource(discord.PCMVolumeTransformer):
         logger.info(f"Title: {data.get('title')}, Streaming URL: {filename}")
 
         # Create the audio source with streaming options
-        audio_source = discord.FFmpegPCMAudio(
-            filename,
-            before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"',
-            options='-vn -ar 48000 -ac 2 -b:a 128k -f s16le'
-        )
+        try:
+            # Updated yt-dlp (2026.1.29) now handles YouTube streaming properly
+            audio_source = discord.FFmpegPCMAudio(
+                filename,
+                before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+                options='-vn -ar 48000 -ac 2 -f s16le'
+            )
+            logger.info(f"FFmpegPCMAudio created successfully for streaming URL")
+
+            # Check if process started
+            if hasattr(audio_source, '_process') and audio_source._process:
+                logger.info(f"FFmpeg process started: PID {audio_source._process.pid if hasattr(audio_source._process, 'pid') else 'unknown'}")
+            else:
+                logger.warning(f"FFmpeg process not started immediately after creation")
+        except Exception as e:
+            logger.error(f"Failed to create FFmpegPCMAudio: {e}")
+            logger.error(traceback.format_exc())
+            raise
         
-        # Add a small delay to ensure the source is properly initialized
-        await asyncio.sleep(0.5)
-        
+        # Add a delay to ensure FFmpeg process starts and begins buffering
+        # This is critical for streaming sources
+        await asyncio.sleep(2.0)
+
         logger.info(f"Created streaming YTDLSource for URL: {url}, title: {data.get('title')}")
         # Ensure volume is set at a good audible level
         source = cls(audio_source, data=data)
         source.volume = 0.8  # Set a slightly higher volume to ensure audibility
-        
-        # Test the source to make sure it's valid
+
+        # Log audio source info without disrupting it
         try:
-            # Check if the source is readable
             if hasattr(audio_source, 'read'):
                 logger.info(f"Audio source is readable for {data.get('title')}")
-                # Try to read a small amount to test
-                try:
-                    test_read = audio_source.read(1024)
-                    if test_read:
-                        logger.info(f"Successfully read {len(test_read)} bytes from audio source")
-                    else:
-                        logger.warning(f"Audio source returned empty data")
-                except Exception as read_error:
-                    logger.error(f"Error reading from audio source: {read_error}")
             else:
                 logger.warning(f"Audio source may not be readable for {data.get('title')}")
-                
+
             # Check if the source has a process attribute
             if hasattr(audio_source, 'process'):
                 logger.info(f"Audio source has process: {audio_source.process}")
             else:
                 logger.info(f"Audio source does not have process attribute")
-                
+
         except Exception as e:
-            logger.error(f"Error testing audio source: {e}")
+            logger.error(f"Error checking audio source: {e}")
             
         return source
     
@@ -372,12 +383,16 @@ async def handle_skip_request(ctx):
     guild_id = ctx.guild.id
     guild_id_str = str(guild_id)
     logger.info(f"Skip functionality called for guild {guild_id_str}")
-    
+
     if not ctx.voice_client:
         logger.warning(f"Skip called but bot not connected to voice in guild {guild_id_str}")
         return "Error: I'm not connected to a voice channel."
-    
-    if not ctx.voice_client.is_playing() and not ctx.voice_client.is_paused():
+
+    # Check if something is playing OR if there's a current song (handles edge cases)
+    is_active = ctx.voice_client.is_playing() or ctx.voice_client.is_paused()
+    has_current_song = guild_id_str in current_song and current_song[guild_id_str] is not None
+
+    if not is_active and not has_current_song:
         logger.warning(f"Skip called but nothing is playing in guild {guild_id_str}")
         return "Error: Nothing is playing right now."
     
@@ -519,12 +534,16 @@ async def handle_stop_request(ctx):
     guild_id = ctx.guild.id
     guild_id_str = str(guild_id)
     logger.info(f"Stop functionality called for guild {guild_id_str}")
-    
+
     if not ctx.voice_client:
         logger.warning(f"Stop called but bot not connected to voice in guild {guild_id_str}")
         return "Error: I'm not connected to a voice channel."
-    
-    if not ctx.voice_client.is_playing() and not ctx.voice_client.is_paused():
+
+    # Check if something is playing OR if there's a current song (handles edge cases)
+    is_active = ctx.voice_client.is_playing() or ctx.voice_client.is_paused()
+    has_current_song = guild_id_str in current_song and current_song[guild_id_str] is not None
+
+    if not is_active and not has_current_song:
         logger.warning(f"Stop called but nothing is playing in guild {guild_id_str}")
         return "Error: Nothing is playing right now."
     
@@ -661,6 +680,21 @@ async def on_error(event, *args, **kwargs):
     """Global error handler for bot events"""
     logger.error(f"Error in event {event}: {args} {kwargs}")
     # Log the full traceback for debugging
+    import traceback
+    logger.error(f"Full traceback: {traceback.format_exc()}")
+
+@bot.event
+async def on_command_error(ctx, error):
+    """Handle command errors gracefully"""
+    from discord.ext import commands
+
+    # Ignore CommandNotFound errors (users trying to use prefix commands)
+    if isinstance(error, commands.CommandNotFound):
+        logger.debug(f"Ignored CommandNotFound error: {error}")
+        return
+
+    # Log other errors
+    logger.error(f"Command error in {ctx.command}: {error}")
     import traceback
     logger.error(f"Full traceback: {traceback.format_exc()}")
 
@@ -1404,6 +1438,23 @@ async def handle_play_request(ctx, search: str):
                 logger.info(f"Playing: {player.title}")
                 def after_callback(error):
                     """Handle the after callback with better error handling"""
+                    # Capture FFmpeg stderr output for debugging
+                    if hasattr(player, 'original') and hasattr(player.original, '_process'):
+                        process = player.original._process
+                        if process and hasattr(process, 'stderr') and process.stderr:
+                            try:
+                                stderr_output = process.stderr.read()
+                                if stderr_output:
+                                    logger.error(f"FFmpeg stderr output: {stderr_output.decode('utf-8', errors='ignore')[:2000]}")
+                            except Exception as e:
+                                logger.error(f"Failed to read FFmpeg stderr: {e}")
+
+                        # Log process return code
+                        if process and hasattr(process, 'poll'):
+                            return_code = process.poll()
+                            if return_code is not None:
+                                logger.info(f"FFmpeg process exited with code: {return_code}")
+
                     if error:
                         logger.error(f"Audio playback error for {player.title}: {error}")
                         logger.error(f"Error type: {type(error).__name__}")
@@ -1416,14 +1467,29 @@ async def handle_play_request(ctx, search: str):
                             logger.warning(f"Connection-related error, not calling play_next: {error}")
                             player.cleanup()
                     else:
-                        # Song finished normally
+                        # Song finished normally (or EOF reached)
                         logger.info(f"Song finished normally: {player.title}")
                         player.cleanup()
                         asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
                 
                 # Add a small delay to ensure the source is ready
                 await asyncio.sleep(1.0)
+
+                # Verify player is valid before playing
+                if player and hasattr(player, 'original'):
+                    logger.info(f"Player has original source: {type(player.original).__name__}")
+                    if hasattr(player.original, '_process'):
+                        if player.original._process:
+                            logger.info(f"Original source has FFmpeg process running")
+                        else:
+                            logger.warning(f"Original source FFmpeg process is None!")
+                    else:
+                        logger.warning(f"Original source has no _process attribute")
+                else:
+                    logger.error(f"Player is invalid or has no original source!")
+
                 ctx.voice_client.play(player, after=after_callback)
+                logger.info(f"voice_client.play() called for {player.title}")
                 
                 # Set the current song and log it
                 current_song[guild_id_str] = player
