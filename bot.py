@@ -222,6 +222,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
                 # Create the audio source with simple streaming options
                 audio_source = discord.FFmpegPCMAudio(
                     filename,
+                    executable=ffmpeg_path,
                     before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
                     options='-vn -ar 48000 -ac 2 -f s16le'
                 )
@@ -317,6 +318,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
             # Updated yt-dlp (2026.1.29) now handles YouTube streaming properly
             audio_source = discord.FFmpegPCMAudio(
                 filename,
+                executable=ffmpeg_path,
                 before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
                 options='-vn -ar 48000 -ac 2 -f s16le'
             )
@@ -3744,6 +3746,7 @@ async def talk(ctx, *, text: str):
     # Play the generated TTS
     source = discord.FFmpegPCMAudio(
         temp_filename,
+        executable=ffmpeg_path,
         before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
         options="-vn -ar 48000 -ac 2 -b:a 128k -f s16le"
     )
