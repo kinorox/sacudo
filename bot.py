@@ -11,6 +11,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import datetime
 import traceback
+import json
 import atexit
 import threading
 import time
@@ -472,92 +473,263 @@ def spotify_track_to_query(track_info):
         return None
 
 
-async def get_spotify_track(url):
-    """Fetch track metadata from Spotify API for a single track URL.
+async def scrape_spotify_track(url):
+    """Scrape track metadata from Spotify's public web page (no API/Premium needed).
 
+    Parses the <title> tag which has format: "Song Name - song and lyrics by Artist | Spotify"
     Returns a YouTube search query string, or None on failure.
     """
-    if not spotify_client:
-        return None
-
     try:
-        _, track_id = extract_spotify_id(url)
-        if not track_id:
-            return None
+        clean_url = re.sub(r'\?.*$', '', url)  # Strip query params
+        if not clean_url.startswith('http'):
+            _, track_id = extract_spotify_id(url)
+            clean_url = f"https://open.spotify.com/track/{track_id}"
 
-        track_info = await bot.loop.run_in_executor(
-            None, lambda: spotify_client.track(track_id)
-        )
+        async with aiohttp.ClientSession() as session:
+            async with session.get(clean_url, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }) as response:
+                if response.status != 200:
+                    logger.error(f"Spotify page returned status {response.status} for {clean_url}")
+                    return None
+                html = await response.text()
 
-        if not track_info:
-            logger.error(f"No track info returned for Spotify track: {track_id}")
-            return None
+        # Parse <title> tag: "Song Name - song and lyrics by Artist | Spotify"
+        title_match = re.search(r'<title>(.+?)</title>', html)
+        if title_match:
+            title_text = title_match.group(1)
+            # Try the "song and lyrics by" pattern
+            track_match = re.match(r'(.+?) - song and lyrics by (.+?) \| Spotify', title_text)
+            if track_match:
+                track_name = track_match.group(1).strip()
+                artist_name = track_match.group(2).strip()
+                query = f"{artist_name} - {track_name}"
+                logger.info(f"Spotify track scraped: {url} -> '{query}'")
+                return query
+            # Try the "song by" pattern (alternate format)
+            track_match = re.match(r'(.+?) - song by (.+?) \| Spotify', title_text)
+            if track_match:
+                track_name = track_match.group(1).strip()
+                artist_name = track_match.group(2).strip()
+                query = f"{artist_name} - {track_name}"
+                logger.info(f"Spotify track scraped: {url} -> '{query}'")
+                return query
 
-        query = spotify_track_to_query(track_info)
-        logger.info(f"Spotify track resolved: {url} -> '{query}'")
-        return query
+        # Fallback: try og:title + og:description meta tags
+        og_title = re.search(r'<meta property="og:title" content="([^"]+)"', html)
+        og_desc = re.search(r'<meta property="og:description" content="([^"]+)"', html)
+        if og_title and og_desc:
+            track_name = og_title.group(1)
+            # Description format: "Artist · Song · Album · Year" or similar
+            desc_parts = og_desc.group(1).split(' · ')
+            if len(desc_parts) >= 2:
+                artist_name = desc_parts[0].replace('Listen to ', '').strip()
+                query = f"{artist_name} - {track_name}"
+                logger.info(f"Spotify track scraped (meta): {url} -> '{query}'")
+                return query
+
+        logger.error(f"Could not parse Spotify track page: {url}")
+        return None
     except Exception as e:
-        logger.error(f"Error fetching Spotify track info: {e}")
+        logger.error(f"Error scraping Spotify track page: {e}")
         logger.error(traceback.format_exc())
         return None
 
 
+async def scrape_spotify_playlist_tracks(url):
+    """Scrape playlist/album track listings from Spotify's public web page.
+
+    Looks for embedded JSON data in the HTML that contains track listings.
+    Returns a list of YouTube search query strings, capped at 50 tracks.
+    Returns None on failure.
+    """
+    try:
+        clean_url = re.sub(r'\?.*$', '', url)  # Strip query params
+        resource_type, resource_id = extract_spotify_id(url)
+        if not clean_url.startswith('http'):
+            clean_url = f"https://open.spotify.com/{resource_type}/{resource_id}"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(clean_url, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }) as response:
+                if response.status != 200:
+                    logger.error(f"Spotify page returned status {response.status} for {clean_url}")
+                    return None
+                html = await response.text()
+
+        tracks = []
+
+        # Try to find embedded JSON data with track listings
+        # Look for script tags containing track data
+        script_matches = re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL)
+        for script_content in script_matches:
+            if '"track"' in script_content and '"artists"' in script_content and '"name"' in script_content:
+                try:
+                    data = json.loads(script_content)
+                    tracks = _extract_tracks_from_json(data)
+                    if tracks:
+                        break
+                except (json.JSONDecodeError, ValueError):
+                    continue
+
+        # Try meta tag with Spotify entity data
+        if not tracks:
+            meta_match = re.search(r'<meta name="spotify:entity_data" content="([^"]+)"', html)
+            if meta_match:
+                try:
+                    import base64
+                    decoded = base64.b64decode(meta_match.group(1)).decode('utf-8')
+                    data = json.loads(decoded)
+                    tracks = _extract_tracks_from_json(data)
+                except Exception as e:
+                    logger.debug(f"Could not decode spotify:entity_data: {e}")
+
+        # Fallback: extract individual track links and titles from the HTML
+        if not tracks:
+            # Look for track patterns in meta content or structured data
+            track_patterns = re.findall(
+                r'"name"\s*:\s*"([^"]+)"\s*,\s*"artists?".*?"name"\s*:\s*"([^"]+)"',
+                html
+            )
+            seen = set()
+            for track_name, artist_name in track_patterns[:50]:
+                query = f"{artist_name} - {track_name}"
+                if query not in seen:
+                    seen.add(query)
+                    tracks.append(query)
+
+        if tracks:
+            tracks = tracks[:50]  # Cap at 50
+            logger.info(f"Spotify {resource_type} scraped: {url} -> {len(tracks)} tracks")
+            return tracks
+
+        logger.error(f"Could not extract tracks from Spotify {resource_type} page: {url}")
+        return None
+    except Exception as e:
+        logger.error(f"Error scraping Spotify {resource_type} page: {e}")
+        logger.error(traceback.format_exc())
+        return None
+
+
+def _extract_tracks_from_json(data):
+    """Recursively extract track name/artist pairs from nested JSON data."""
+    tracks = []
+
+    if isinstance(data, dict):
+        # Check if this dict represents a track
+        if data.get('type') == 'track' and data.get('name') and data.get('artists'):
+            artists = ", ".join([a.get('name', '') for a in data['artists'] if a.get('name')])
+            if artists:
+                tracks.append(f"{artists} - {data['name']}")
+                return tracks
+
+        # Check for items/tracks arrays
+        for key in ('items', 'tracks', 'trackList', 'entries'):
+            if key in data and isinstance(data[key], list):
+                for item in data[key][:50]:
+                    if isinstance(item, dict):
+                        # Unwrap playlist item format: {track: {...}}
+                        track_data = item.get('track', item)
+                        if isinstance(track_data, dict) and track_data.get('name'):
+                            artists_list = track_data.get('artists', [])
+                            if artists_list:
+                                artists = ", ".join([a.get('name', '') for a in artists_list if a.get('name')])
+                                if artists:
+                                    tracks.append(f"{artists} - {track_data['name']}")
+                if tracks:
+                    return tracks
+
+        # Recurse into nested dicts
+        for value in data.values():
+            result = _extract_tracks_from_json(value)
+            if result:
+                return result
+
+    elif isinstance(data, list):
+        for item in data:
+            result = _extract_tracks_from_json(item)
+            if result:
+                return result
+
+    return tracks
+
+
+async def get_spotify_track(url):
+    """Fetch track metadata from Spotify API (with web scraping fallback).
+
+    Returns a YouTube search query string, or None on failure.
+    """
+    # Try API first if available
+    if spotify_client:
+        try:
+            _, track_id = extract_spotify_id(url)
+            if track_id:
+                track_info = await bot.loop.run_in_executor(
+                    None, lambda: spotify_client.track(track_id)
+                )
+                if track_info:
+                    query = spotify_track_to_query(track_info)
+                    if query:
+                        logger.info(f"Spotify track resolved (API): {url} -> '{query}'")
+                        return query
+        except Exception as e:
+            logger.warning(f"Spotify API failed for track, falling back to scraping: {e}")
+
+    # Fall back to web scraping
+    return await scrape_spotify_track(url)
+
+
 async def get_spotify_playlist_tracks(url):
-    """Fetch all track metadata from a Spotify playlist or album URL.
+    """Fetch playlist/album track listings (API with web scraping fallback).
 
     Returns a list of YouTube search query strings, capped at 50 tracks.
     Returns None on failure.
     """
-    if not spotify_client:
-        return None
-
     resource_type, resource_id = extract_spotify_id(url)
     if not resource_id:
         return None
 
-    try:
-        tracks = []
+    # Try API first if available
+    if spotify_client:
+        try:
+            tracks = []
 
-        if resource_type == 'playlist':
-            results = await bot.loop.run_in_executor(
-                None, lambda: spotify_client.playlist_tracks(
-                    resource_id, limit=50, additional_types=('track',)
+            if resource_type == 'playlist':
+                results = await bot.loop.run_in_executor(
+                    None, lambda: spotify_client.playlist_tracks(
+                        resource_id, limit=50, additional_types=('track',)
+                    )
                 )
-            )
+                if results and 'items' in results:
+                    for item in results['items'][:50]:
+                        track = item.get('track')
+                        if track and track.get('name'):
+                            query = spotify_track_to_query(track)
+                            if query:
+                                tracks.append(query)
 
-            if results and 'items' in results:
-                for item in results['items'][:50]:
-                    track = item.get('track')
-                    if track and track.get('name'):
-                        query = spotify_track_to_query(track)
-                        if query:
+            elif resource_type == 'album':
+                results = await bot.loop.run_in_executor(
+                    None, lambda: spotify_client.album_tracks(resource_id, limit=50)
+                )
+                if results and 'items' in results:
+                    for track in results['items'][:50]:
+                        if track and track.get('name'):
+                            track_artists = ", ".join(
+                                [a['name'] for a in track.get('artists', [])]
+                            ) if track.get('artists') else "Unknown Artist"
+                            query = f"{track_artists} - {track['name']}"
                             tracks.append(query)
 
-        elif resource_type == 'album':
-            results = await bot.loop.run_in_executor(
-                None, lambda: spotify_client.album_tracks(resource_id, limit=50)
-            )
+            if tracks:
+                logger.info(f"Spotify {resource_type} resolved (API): {url} -> {len(tracks)} tracks")
+                return tracks
+        except Exception as e:
+            logger.warning(f"Spotify API failed for {resource_type}, falling back to scraping: {e}")
 
-            if results and 'items' in results:
-                for track in results['items'][:50]:
-                    if track and track.get('name'):
-                        track_artists = ", ".join(
-                            [a['name'] for a in track.get('artists', [])]
-                        ) if track.get('artists') else "Unknown Artist"
-                        query = f"{track_artists} - {track['name']}"
-                        tracks.append(query)
-
-        logger.info(f"Spotify {resource_type} resolved: {url} -> {len(tracks)} tracks")
-        return tracks if tracks else None
-
-    except Exception as e:
-        error_str = str(e)
-        if '404' in error_str:
-            logger.error(f"Spotify {resource_type} not found (404). It may be private or a personalized playlist: {url}")
-        else:
-            logger.error(f"Error fetching Spotify {resource_type} tracks: {e}")
-            logger.error(traceback.format_exc())
-        return None
+    # Fall back to web scraping
+    return await scrape_spotify_playlist_tracks(url)
 
 
 # 🎵 Handler functions for player controls 🎵
@@ -1485,9 +1657,6 @@ async def handle_play_request(ctx, search: str):
     # Check for Spotify URLs first (before YouTube playlist detection)
     spotify_type = is_spotify_url(search)
     if spotify_type:
-        if not spotify_client:
-            return "Error: Spotify support is not configured. Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in your .env file."
-
         if spotify_type in ('playlist', 'album'):
             logger.info(f"Detected Spotify {spotify_type} URL: {search}")
             return await handle_spotify_playlist(ctx, search)
@@ -3363,9 +3532,6 @@ def play_song(guild_id):
     # Check for Spotify URLs first
     spotify_type = is_spotify_url(search)
     if spotify_type:
-        if not spotify_client:
-            return jsonify({"error": "Spotify support not configured. Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET."}), 400
-
         if spotify_type in ('playlist', 'album'):
             logger.info(f"API: Detected Spotify {spotify_type} URL: {search}")
             try:
