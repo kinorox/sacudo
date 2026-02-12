@@ -74,6 +74,29 @@ API_PORT = int(os.getenv("API_PORT", 8000))
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is not set in the environment variables!")
 
+# Spotify API configuration (optional - for Spotify URL support)
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
+
+spotify_client = None
+try:
+    if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
+        import spotipy
+        from spotipy.oauth2 import SpotifyClientCredentials
+        from spotipy.cache_handler import MemoryCacheHandler
+        spotify_client = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
+            client_id=SPOTIFY_CLIENT_ID,
+            client_secret=SPOTIFY_CLIENT_SECRET,
+            cache_handler=MemoryCacheHandler()
+        ))
+        logger.info("Spotify client initialized successfully")
+    else:
+        logger.info("Spotify credentials not set - Spotify URL support disabled")
+except ImportError:
+    logger.warning("spotipy package not installed - Spotify URL support disabled")
+except Exception as e:
+    logger.error(f"Error initializing Spotify client: {e}")
+
 # Create a PID file to indicate that the bot is running
 def create_pid_file():
     """Create a PID file for the bot to allow detection by other processes"""
@@ -377,6 +400,164 @@ class YTDLSource(discord.PCMVolumeTransformer):
     def __del__(self):
         """Ensure cleanup happens when the object is garbage collected."""
         self.cleanup()
+
+
+# 🎵 Spotify URL helpers 🎵
+
+def is_spotify_url(text):
+    """Check if the provided text is a Spotify URL.
+
+    Returns the Spotify URL type ('track', 'playlist', 'album') or None.
+    """
+    if not text:
+        return None
+
+    # Match open.spotify.com URLs
+    spotify_url_match = re.search(
+        r'(?:https?://)?(?:open\.)?spotify\.com/(track|playlist|album)/([a-zA-Z0-9]+)',
+        text
+    )
+    if spotify_url_match:
+        return spotify_url_match.group(1)
+
+    # Match Spotify URI format (spotify:track:xxx)
+    spotify_uri_match = re.match(
+        r'spotify:(track|playlist|album):([a-zA-Z0-9]+)',
+        text
+    )
+    if spotify_uri_match:
+        return spotify_uri_match.group(1)
+
+    return None
+
+
+def extract_spotify_id(url):
+    """Extract the Spotify resource ID from a URL or URI.
+
+    Returns (resource_type, resource_id) tuple or (None, None).
+    """
+    if not url:
+        return None, None
+
+    # Match open.spotify.com URLs
+    match = re.search(
+        r'(?:https?://)?(?:open\.)?spotify\.com/(track|playlist|album)/([a-zA-Z0-9]+)',
+        url
+    )
+    if match:
+        return match.group(1), match.group(2)
+
+    # Match Spotify URI format
+    match = re.match(
+        r'spotify:(track|playlist|album):([a-zA-Z0-9]+)',
+        url
+    )
+    if match:
+        return match.group(1), match.group(2)
+
+    return None, None
+
+
+def spotify_track_to_query(track_info):
+    """Convert Spotify track info dict to a YouTube search query string.
+
+    Returns a string like "Artist1, Artist2 - Track Name" or None on failure.
+    """
+    try:
+        artists = ", ".join([artist['name'] for artist in track_info['artists']])
+        track_name = track_info['name']
+        return f"{artists} - {track_name}"
+    except (KeyError, TypeError) as e:
+        logger.error(f"Error converting Spotify track to search query: {e}")
+        return None
+
+
+async def get_spotify_track(url):
+    """Fetch track metadata from Spotify API for a single track URL.
+
+    Returns a YouTube search query string, or None on failure.
+    """
+    if not spotify_client:
+        return None
+
+    try:
+        _, track_id = extract_spotify_id(url)
+        if not track_id:
+            return None
+
+        track_info = await bot.loop.run_in_executor(
+            None, lambda: spotify_client.track(track_id)
+        )
+
+        if not track_info:
+            logger.error(f"No track info returned for Spotify track: {track_id}")
+            return None
+
+        query = spotify_track_to_query(track_info)
+        logger.info(f"Spotify track resolved: {url} -> '{query}'")
+        return query
+    except Exception as e:
+        logger.error(f"Error fetching Spotify track info: {e}")
+        logger.error(traceback.format_exc())
+        return None
+
+
+async def get_spotify_playlist_tracks(url):
+    """Fetch all track metadata from a Spotify playlist or album URL.
+
+    Returns a list of YouTube search query strings, capped at 50 tracks.
+    Returns None on failure.
+    """
+    if not spotify_client:
+        return None
+
+    resource_type, resource_id = extract_spotify_id(url)
+    if not resource_id:
+        return None
+
+    try:
+        tracks = []
+
+        if resource_type == 'playlist':
+            results = await bot.loop.run_in_executor(
+                None, lambda: spotify_client.playlist_tracks(
+                    resource_id, limit=50, additional_types=('track',)
+                )
+            )
+
+            if results and 'items' in results:
+                for item in results['items'][:50]:
+                    track = item.get('track')
+                    if track and track.get('name'):
+                        query = spotify_track_to_query(track)
+                        if query:
+                            tracks.append(query)
+
+        elif resource_type == 'album':
+            results = await bot.loop.run_in_executor(
+                None, lambda: spotify_client.album_tracks(resource_id, limit=50)
+            )
+
+            if results and 'items' in results:
+                for track in results['items'][:50]:
+                    if track and track.get('name'):
+                        track_artists = ", ".join(
+                            [a['name'] for a in track.get('artists', [])]
+                        ) if track.get('artists') else "Unknown Artist"
+                        query = f"{track_artists} - {track['name']}"
+                        tracks.append(query)
+
+        logger.info(f"Spotify {resource_type} resolved: {url} -> {len(tracks)} tracks")
+        return tracks if tracks else None
+
+    except Exception as e:
+        error_str = str(e)
+        if '404' in error_str:
+            logger.error(f"Spotify {resource_type} not found (404). It may be private or a personalized playlist: {url}")
+        else:
+            logger.error(f"Error fetching Spotify {resource_type} tracks: {e}")
+            logger.error(traceback.format_exc())
+        return None
 
 
 # 🎵 Handler functions for player controls 🎵
@@ -1301,6 +1482,23 @@ async def handle_play_request(ctx, search: str):
         logger.info(f"Bot not in voice channel, joining for guild {guild_id_str}")
         await ctx.invoke(join)
 
+    # Check for Spotify URLs first (before YouTube playlist detection)
+    spotify_type = is_spotify_url(search)
+    if spotify_type:
+        if not spotify_client:
+            return "Error: Spotify support is not configured. Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in your .env file."
+
+        if spotify_type in ('playlist', 'album'):
+            logger.info(f"Detected Spotify {spotify_type} URL: {search}")
+            return await handle_spotify_playlist(ctx, search)
+        elif spotify_type == 'track':
+            logger.info(f"Detected Spotify track URL: {search}")
+            search_query = await get_spotify_track(search)
+            if not search_query:
+                return "Error: Could not resolve Spotify track. Please try a different URL."
+            await ctx.send(f"🔍 Spotify track found, searching YouTube for: **{search_query}**")
+            search = search_query  # Replace with YouTube search query, fall through to normal flow
+
     if 'list=' in search:
         logger.info(f"Detected playlist URL: {search}")
         return await handle_playlist(ctx, search)
@@ -2090,6 +2288,82 @@ async def preload_next_song(ctx):
             logger.error(f"Error preloading song in guild {guild_id_str}: {e}")
             logger.error(traceback.format_exc())
             pass
+
+
+async def handle_spotify_playlist(ctx, url):
+    """Handle a Spotify playlist or album URL by resolving tracks and queuing them."""
+    logger.info(f"Handling Spotify playlist/album URL: {url}")
+    guild_id = ctx.guild.id
+    guild_id_str = str(guild_id)
+
+    # Ensure bot is connected to voice channel
+    if not ctx.voice_client:
+        logger.info(f"Bot not in voice channel, joining for Spotify playlist in guild {guild_id_str}")
+        await ctx.invoke(join)
+
+    resource_type, _ = extract_spotify_id(url)
+    type_name = "playlist" if resource_type == "playlist" else "album"
+
+    await ctx.send(f"🎵 Processing Spotify {type_name}...")
+
+    # Fetch tracks from Spotify
+    search_queries = await get_spotify_playlist_tracks(url)
+
+    if not search_queries:
+        await ctx.send(f"❌ Could not load Spotify {type_name}. It may be private or a personalized mix (those require user login and aren't supported). Try a public {type_name}.")
+        return
+
+    # Initialize queue if needed
+    if guild_id_str not in queues:
+        queues[guild_id_str] = deque()
+        logger.info(f"Created new queue for guild {guild_id_str}")
+
+    # Add tracks to queue with deduplication
+    unique_queries = set()
+    added_count = 0
+    total_entries = len(search_queries)
+
+    for i, query in enumerate(search_queries):
+        if query and query not in unique_queries:
+            unique_queries.add(query)
+            queues[guild_id_str].append(query)
+            added_count += 1
+
+            # Background task to resolve search to YouTube URL
+            asyncio.create_task(extract_song_info_for_queue(query, guild_id))
+
+        # Progress updates for large playlists
+        if total_entries > 20 and (i + 1) % 10 == 0:
+            logger.info(f"Processing Spotify {type_name}: {i + 1}/{total_entries} songs")
+            try:
+                await ctx.send(
+                    f"📊 Processing Spotify {type_name}: {i + 1}/{total_entries} songs...",
+                    delete_after=5
+                )
+            except:
+                pass
+
+    if added_count == 0:
+        await ctx.send(f"❌ No valid songs found in the Spotify {type_name}.")
+        return
+
+    logger.info(f"Added {added_count} songs from Spotify {type_name} to queue for guild {guild_id_str}")
+
+    # Fix queue to remove duplicates
+    await fix_queue(guild_id)
+
+    # Emit queue update for dashboard
+    emit_to_guild(guild_id, 'queue_update', {
+        'guild_id': guild_id_str,
+        'queue': queue_to_list(guild_id_str),
+        'action': 'add_playlist'
+    })
+
+    # Start playback if not already playing
+    if not ctx.voice_client or not ctx.voice_client.is_playing():
+        await play_next(ctx)
+    else:
+        await ctx.send(f"🎵 Added {added_count} songs from Spotify {type_name} to the queue.")
 
 
 async def handle_playlist(ctx, url):
@@ -3086,6 +3360,44 @@ def play_song(guild_id):
     if guild_id not in queues:
         queues[guild_id] = deque()
     
+    # Check for Spotify URLs first
+    spotify_type = is_spotify_url(search)
+    if spotify_type:
+        if not spotify_client:
+            return jsonify({"error": "Spotify support not configured. Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET."}), 400
+
+        if spotify_type in ('playlist', 'album'):
+            logger.info(f"API: Detected Spotify {spotify_type} URL: {search}")
+            try:
+                async def run_spotify_handler():
+                    return await handle_spotify_playlist(fake_ctx, search)
+
+                future = asyncio.run_coroutine_threadsafe(run_spotify_handler(), bot.loop)
+                future.result(timeout=30)
+                return jsonify({"success": True, "message": f"Spotify {spotify_type} added to queue"}), 200
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout handling Spotify {spotify_type} in API endpoint: {search}")
+                return jsonify({"error": "Spotify processing timed out. Try a smaller playlist."}), 408
+            except Exception as e:
+                logger.error(f"Error handling Spotify in API endpoint: {e}")
+                logger.error(traceback.format_exc())
+                return jsonify({"error": f"Error processing Spotify URL: {str(e)}"}), 500
+
+        elif spotify_type == 'track':
+            logger.info(f"API: Detected Spotify track URL: {search}")
+            try:
+                async def resolve_spotify():
+                    return await get_spotify_track(search)
+
+                future = asyncio.run_coroutine_threadsafe(resolve_spotify(), bot.loop)
+                resolved_query = future.result(timeout=15)
+                if not resolved_query:
+                    return jsonify({"error": "Could not resolve Spotify track"}), 400
+                search = resolved_query  # Replace with YouTube search query
+            except Exception as e:
+                logger.error(f"Error resolving Spotify track in API: {e}")
+                return jsonify({"error": f"Error resolving Spotify track: {str(e)}"}), 500
+
     # Explicitly check for playlist URL - same logic as in handle_play_request
     if 'list=' in search:
         logger.info(f"API: Detected playlist URL: {search}")

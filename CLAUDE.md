@@ -74,6 +74,8 @@ BOT_TOKEN=your_discord_bot_token_here
 API_PORT=8000  # Optional, defaults to 8000
 ELEVENLABS_API_KEY=your_key_here  # Optional, for TTS
 ELEVENLABS_VOICE_ID=your_voice_id_here  # Optional, for TTS
+SPOTIFY_CLIENT_ID=your_spotify_client_id_here  # Optional, for Spotify URL support
+SPOTIFY_CLIENT_SECRET=your_spotify_client_secret_here  # Optional, for Spotify URL support
 ```
 
 ## Testing Strategy
