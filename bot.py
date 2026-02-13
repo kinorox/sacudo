@@ -215,7 +215,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
             return True
             
         # Other common music services
-        if any(domain in text for domain in ['spotify.com', 'soundcloud.com', 'bandcamp.com']):
+        if any(domain in text for domain in ['spotify.com', 'soundcloud.com', 'bandcamp.com', 'suno.com', 'suno.ai']):
             return True
             
         return False
@@ -384,8 +384,44 @@ class YTDLSource(discord.PCMVolumeTransformer):
             logger.error(f"Error checking audio source: {e}")
             
         return source
-    
-        
+
+    @classmethod
+    async def from_suno_url(cls, url, *, loop=None):
+        """Create a YTDLSource from a Suno song URL by streaming the CDN MP3 directly."""
+        loop = loop or asyncio.get_event_loop()
+
+        suno_data = await scrape_suno_song(url)
+        if not suno_data or not suno_data.get('audio_url'):
+            raise YTDLError(f"Could not extract audio from Suno URL: {url}")
+
+        audio_url = suno_data['audio_url']
+        logger.info(f"Streaming Suno audio directly: {audio_url}")
+
+        data = {
+            'title': suno_data.get('title', 'Suno Song'),
+            'webpage_url': suno_data.get('webpage_url', url),
+            'url': audio_url,
+            'duration': suno_data.get('duration'),
+            'thumbnail': suno_data.get('thumbnail'),
+        }
+
+        # Cache for queue display
+        song_cache[url] = data
+
+        audio_source = discord.FFmpegPCMAudio(
+            audio_url,
+            executable=ffmpeg_path,
+            before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+            options='-vn -ar 48000 -ac 2 -f s16le'
+        )
+
+        await asyncio.sleep(2.0)
+
+        source = cls(audio_source, data=data)
+        source.volume = 0.8
+        logger.info(f"Created Suno YTDLSource: {data['title']}")
+        return source
+
     def cleanup(self):
         """Clean up resources when the source is done."""
         if hasattr(self, '_process') and self._process:
@@ -730,6 +766,89 @@ async def get_spotify_playlist_tracks(url):
 
     # Fall back to web scraping
     return await scrape_spotify_playlist_tracks(url)
+
+
+# 🎵 Suno URL helpers 🎵
+
+def is_suno_url(text):
+    """Check if the provided text is a Suno song URL.
+
+    Returns the song ID (UUID) or None.
+    """
+    if not text:
+        return None
+    match = re.search(
+        r'(?:https?://)?(?:www\.)?(?:suno\.com|app\.suno\.ai)/song/([a-f0-9-]+)',
+        text
+    )
+    return match.group(1) if match else None
+
+
+async def scrape_suno_song(url):
+    """Scrape song metadata and audio URL from a Suno song page.
+
+    Extracts the direct CDN audio URL from the og:audio meta tag,
+    with a fallback to constructing it from the song UUID.
+
+    Returns a dict with audio_url, title, webpage_url, thumbnail, or None on failure.
+    """
+    try:
+        song_id = is_suno_url(url)
+        if not song_id:
+            logger.error(f"Could not extract Suno song ID from URL: {url}")
+            return None
+
+        clean_url = f"https://suno.com/song/{song_id}"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(clean_url, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }) as response:
+                if response.status != 200:
+                    logger.error(f"Suno page returned status {response.status} for {clean_url}")
+                    return None
+                html = await response.text()
+
+        result = {
+            'webpage_url': clean_url,
+            'audio_url': None,
+            'title': None,
+            'thumbnail': None,
+        }
+
+        # Extract direct audio URL from og:audio meta tag
+        og_audio = re.search(r'<meta property="og:audio" content="([^"]+)"', html)
+        if og_audio:
+            result['audio_url'] = og_audio.group(1)
+            logger.info(f"Suno og:audio found: {result['audio_url']}")
+        else:
+            # Fallback: construct CDN URL from UUID
+            result['audio_url'] = f"https://cdn1.suno.ai/{song_id}.mp3"
+            logger.info(f"Suno og:audio not found, using CDN fallback: {result['audio_url']}")
+
+        # Extract title from og:title
+        og_title = re.search(r'<meta property="og:title" content="([^"]+)"', html)
+        if og_title:
+            result['title'] = og_title.group(1)
+        else:
+            # Fallback: try <title> tag
+            title_match = re.search(r'<title>(.+?)</title>', html)
+            if title_match:
+                result['title'] = title_match.group(1).replace(' | Suno', '').strip()
+            else:
+                result['title'] = f"Suno Song ({song_id[:8]})"
+
+        # Extract thumbnail
+        og_image = re.search(r'<meta property="og:image" content="([^"]+)"', html)
+        if og_image:
+            result['thumbnail'] = og_image.group(1)
+
+        logger.info(f"Suno song scraped: {url} -> '{result['title']}' ({result['audio_url']})")
+        return result
+    except Exception as e:
+        logger.error(f"Error scraping Suno song page: {e}")
+        logger.error(traceback.format_exc())
+        return None
 
 
 # 🎵 Handler functions for player controls 🎵
@@ -1654,7 +1773,43 @@ async def handle_play_request(ctx, search: str):
         logger.info(f"Bot not in voice channel, joining for guild {guild_id_str}")
         await ctx.invoke(join)
 
-    # Check for Spotify URLs first (before YouTube playlist detection)
+    # Check for Suno URLs first (direct CDN streaming, no YouTube needed)
+    suno_id = is_suno_url(search)
+    if suno_id:
+        logger.info(f"Detected Suno song URL: {search}")
+        if ctx.voice_client.is_playing():
+            # Add to queue
+            if guild_id_str not in queues:
+                queues[guild_id_str] = deque()
+            queues[guild_id_str].append(search)
+            emit_to_guild(guild_id, 'queue_update', {
+                'guild_id': guild_id_str,
+                'queue': queue_to_list(guild_id_str),
+                'action': 'add'
+            })
+            # Pre-extract metadata for queue display
+            asyncio.create_task(extract_song_info_for_queue(search, guild_id))
+            return f"🎵 Added Suno song to queue: {search}"
+        else:
+            try:
+                player = await YTDLSource.from_suno_url(search)
+                current_song[guild_id_str] = player
+                ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(
+                    play_next(ctx), bot.loop
+                ) if not e else logger.error(f"Player error: {e}"))
+                await update_music_message(ctx, player)
+                emit_to_guild(guild_id, 'song_update', {
+                    'guild_id': guild_id_str,
+                    'title': player.title,
+                    'url': player.url,
+                })
+                return f"🎵 Now playing Suno song: **{player.title}**"
+            except Exception as e:
+                logger.error(f"Error playing Suno song: {e}")
+                logger.error(traceback.format_exc())
+                return f"Error playing Suno song: {str(e)}"
+
+    # Check for Spotify URLs (before YouTube playlist detection)
     spotify_type = is_spotify_url(search)
     if spotify_type:
         if spotify_type in ('playlist', 'album'):
@@ -1915,6 +2070,29 @@ async def handle_play_request(ctx, search: str):
 async def extract_song_info_for_queue(search, guild_id):
     """Extract song info for a search query to be added to the queue"""
     logger.info(f"Extracting song info for search query in queue: {search}")
+
+    # Handle Suno URLs separately (no yt-dlp needed)
+    if is_suno_url(search):
+        try:
+            suno_data = await scrape_suno_song(search)
+            if suno_data:
+                data = {
+                    'title': suno_data.get('title', 'Suno Song'),
+                    'webpage_url': suno_data.get('webpage_url', search),
+                    'url': suno_data.get('audio_url'),
+                    'thumbnail': suno_data.get('thumbnail'),
+                }
+                song_cache[search] = data
+                emit_to_guild(str(guild_id), 'queue_update', {
+                    'guild_id': str(guild_id),
+                    'queue': queue_to_list(str(guild_id)),
+                    'action': 'update'
+                })
+                logger.info(f"Successfully extracted Suno info for queue: {search} -> {data.get('title')}")
+        except Exception as e:
+            logger.error(f"Error extracting Suno info for queue: {e}")
+        return
+
     try:
         # Use simplified options
         ydl_opts = default_youtube_options.copy()
@@ -2204,7 +2382,10 @@ async def play_next(ctx):
                 
                 # Create the player for the next song
                 logger.info(f"Creating player for next song in guild {guild_id_str}")
-                player = await YTDLSource.from_url(next_url, loop=bot.loop, stream=False)
+                if is_suno_url(next_url):
+                    player = await YTDLSource.from_suno_url(next_url)
+                else:
+                    player = await YTDLSource.from_url(next_url, loop=bot.loop, stream=False)
                 
                 # Ensure we have a stable voice connection
                 if not await ensure_voice_connection(ctx):
@@ -2439,7 +2620,10 @@ async def preload_next_song(ctx):
         logger.info(f"Preloading song: {next_url} for guild {guild_id_str}")
         try:
             # Preload the song
-            player = await YTDLSource.from_url(next_url, loop=bot.loop, stream=False)
+            if is_suno_url(next_url):
+                player = await YTDLSource.from_suno_url(next_url)
+            else:
+                player = await YTDLSource.from_url(next_url, loop=bot.loop, stream=False)
             
             # Double check that this isn't the currently playing song
             if current_song_obj and current_song_obj.title == player.title:
@@ -3529,7 +3713,26 @@ def play_song(guild_id):
     if guild_id not in queues:
         queues[guild_id] = deque()
     
-    # Check for Spotify URLs first
+    # Check for Suno URLs first (direct CDN streaming)
+    suno_id = is_suno_url(search)
+    if suno_id:
+        logger.info(f"API: Detected Suno song URL: {search}")
+        try:
+            async def run_suno_handler():
+                return await handle_play_request(fake_ctx, search)
+
+            future = asyncio.run_coroutine_threadsafe(run_suno_handler(), bot.loop)
+            result = future.result(timeout=30)
+            return jsonify({"success": True, "message": result or "Suno song playing"}), 200
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout handling Suno song in API endpoint: {search}")
+            return jsonify({"error": "Suno processing timed out."}), 408
+        except Exception as e:
+            logger.error(f"Error handling Suno song in API endpoint: {e}")
+            logger.error(traceback.format_exc())
+            return jsonify({"error": f"Error processing Suno URL: {str(e)}"}), 500
+
+    # Check for Spotify URLs
     spotify_type = is_spotify_url(search)
     if spotify_type:
         if spotify_type in ('playlist', 'album'):
