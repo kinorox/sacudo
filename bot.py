@@ -131,6 +131,30 @@ preloaded_songs = {}  # Store preloaded songs for each guild
 playing_locks = {}  # Locks to prevent multiple songs from playing simultaneously
 playback_tasks = {}
 playback_task_locks = {}
+interrupted_playback = {}  # Stores interrupted song info for auto-resume {guild_id_str: {url, seek_seconds, data, title}}
+user_stopping_guilds = set()  # Tracks guilds where stop/skip is user-initiated
+
+
+def check_premature_end(player, guild_id):
+    """Check if a song ended prematurely and store resume info if so."""
+    if guild_id in user_stopping_guilds:
+        user_stopping_guilds.discard(guild_id)
+        return False
+    if player.duration and player.playback_started_at:
+        elapsed = time.time() - player.playback_started_at
+        position = player.seek_offset + elapsed
+        if position < player.duration - 15:
+            guild_id_str = str(guild_id)
+            logger.warning(f"Song ended prematurely: {player.title} at {position:.0f}s / {player.duration:.0f}s")
+            interrupted_playback[guild_id_str] = {
+                'url': player.url,
+                'seek_seconds': position,
+                'data': player.data,
+                'title': player.title,
+            }
+            return True
+    return False
+
 
 # Configure intents
 intents = discord.Intents.default()
@@ -199,6 +223,9 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self._start_time = None
         self._process = None  # Store the FFmpeg process
         self.file_path = None  # Local downloaded file path for cleanup
+        self.playback_started_at = None  # time.time() when playback started
+        self.seek_offset = 0  # Cumulative seek offset for resumed songs
+        self.duration = data.get('duration')  # Song duration in seconds from yt-dlp
 
     @staticmethod
     def is_url(text):
@@ -221,7 +248,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
         return False
 
     @classmethod
-    async def from_url(cls, url_or_search, *, loop=None, stream=False, retry_count=0):
+    async def from_url(cls, url_or_search, *, loop=None, stream=False, retry_count=0, seek_seconds=0):
         loop = loop or asyncio.get_event_loop()
         
         # Check if it's a URL or search term
@@ -244,14 +271,16 @@ class YTDLSource(discord.PCMVolumeTransformer):
                 logger.info(f"Using cached URL for {url}")
                 filename = data['url']
                 # Create the audio source with simple streaming options
+                seek_opt = f'-ss {int(seek_seconds)} ' if seek_seconds else ''
                 audio_source = discord.FFmpegPCMAudio(
                     filename,
                     executable=ffmpeg_path,
-                    before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+                    before_options=f'{seek_opt}-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
                     options='-vn -ar 48000 -ac 2 -f s16le'
                 )
                 source = cls(audio_source, data=data)
                 source.volume = 0.8
+                source.seek_offset = seek_seconds
                 return source
             # For non-direct URLs, we'll need to extract the info again
             # but we can use the cache for displaying metadata
@@ -340,13 +369,14 @@ class YTDLSource(discord.PCMVolumeTransformer):
         # Create the audio source with streaming options
         try:
             # Updated yt-dlp (2026.1.29) now handles YouTube streaming properly
+            seek_opt = f'-ss {int(seek_seconds)} ' if seek_seconds else ''
             audio_source = discord.FFmpegPCMAudio(
                 filename,
                 executable=ffmpeg_path,
-                before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+                before_options=f'{seek_opt}-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
                 options='-vn -ar 48000 -ac 2 -f s16le'
             )
-            logger.info(f"FFmpegPCMAudio created successfully for streaming URL")
+            logger.info(f"FFmpegPCMAudio created successfully for streaming URL{f' (seeking to {int(seek_seconds)}s)' if seek_seconds else ''}")
 
             # Check if process started
             if hasattr(audio_source, '_process') and audio_source._process:
@@ -366,6 +396,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
         # Ensure volume is set at a good audible level
         source = cls(audio_source, data=data)
         source.volume = 0.8  # Set a slightly higher volume to ensure audibility
+        source.seek_offset = seek_seconds
 
         # Log audio source info without disrupting it
         try:
@@ -784,6 +815,20 @@ def is_suno_url(text):
     return match.group(1) if match else None
 
 
+def is_suno_playlist_url(text):
+    """Check if the provided text is a Suno playlist URL.
+
+    Returns the playlist ID (UUID) or None.
+    """
+    if not text:
+        return None
+    match = re.search(
+        r'(?:https?://)?(?:www\.)?(?:suno\.com|app\.suno\.ai)/playlist/([a-f0-9-]+)',
+        text
+    )
+    return match.group(1) if match else None
+
+
 async def scrape_suno_song(url):
     """Scrape song metadata and audio URL from a Suno song page.
 
@@ -851,6 +896,83 @@ async def scrape_suno_song(url):
         return None
 
 
+# Public Suno playlist API: returns the playlist's clips (id, title, audio_url, ...) as JSON
+SUNO_PLAYLIST_API = "https://studio-api.prod.suno.com/api/playlist/{pid}/"
+SUNO_PLAYLIST_MAX_SONGS = 50
+
+
+async def scrape_suno_playlist(url):
+    """Resolve a Suno playlist URL to its list of songs via the public playlist API.
+
+    The playlist page itself is a JS-rendered SPA, but Suno exposes a public,
+    paginated JSON API that returns each clip's id, title and direct CDN audio URL.
+
+    Returns a list of dicts (webpage_url, audio_url, title, thumbnail), capped at
+    SUNO_PLAYLIST_MAX_SONGS, or None on failure.
+    """
+    try:
+        playlist_id = is_suno_playlist_url(url)
+        if not playlist_id:
+            logger.error(f"Could not extract Suno playlist ID from URL: {url}")
+            return None
+
+        songs = []
+        seen_ids = set()
+        total = None
+
+        async with aiohttp.ClientSession() as session:
+            page = 1
+            while len(songs) < SUNO_PLAYLIST_MAX_SONGS and page <= 20:
+                api_url = SUNO_PLAYLIST_API.format(pid=playlist_id) + f"?page={page}"
+                async with session.get(api_url, headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }) as response:
+                    if response.status != 200:
+                        logger.error(f"Suno playlist API returned status {response.status} for {api_url}")
+                        break
+                    data = await response.json(content_type=None)
+
+                if total is None:
+                    total = data.get('num_total_results')
+
+                clips = data.get('playlist_clips') or []
+                if not clips:
+                    break
+
+                for entry in clips:
+                    clip = entry.get('clip') if isinstance(entry, dict) else None
+                    if not clip:
+                        continue
+                    clip_id = clip.get('id')
+                    if not clip_id or clip_id in seen_ids:
+                        continue
+                    seen_ids.add(clip_id)
+                    songs.append({
+                        'webpage_url': f"https://suno.com/song/{clip_id}",
+                        'audio_url': clip.get('audio_url') or f"https://cdn1.suno.ai/{clip_id}.mp3",
+                        'title': clip.get('title') or f"Suno Song ({clip_id[:8]})",
+                        'thumbnail': clip.get('image_large_url') or clip.get('image_url'),
+                    })
+                    if len(songs) >= SUNO_PLAYLIST_MAX_SONGS:
+                        break
+
+                # Stop once we've collected every clip the playlist reported
+                if total is not None and len(seen_ids) >= total:
+                    break
+                page += 1
+
+        if not songs:
+            logger.error(f"No songs found in Suno playlist: {url}")
+            return None
+
+        logger.info(f"Suno playlist scraped: {url} -> {len(songs)} songs")
+        return songs
+    except Exception as e:
+        logger.error(f"Error scraping Suno playlist page: {e}")
+        logger.error(traceback.format_exc())
+        return None
+
+
 # 🎵 Handler functions for player controls 🎵
 async def handle_skip_request(ctx):
     """Core functionality for skipping playback, used by both bot commands and API"""
@@ -907,6 +1029,8 @@ async def handle_skip_request(ctx):
             next_song_title = "Next song in queue"
             logger.info(f"Next song URL: {next_url} (title not in cache)")
     
+    # Mark as user-initiated so after callback doesn't trigger resume
+    user_stopping_guilds.add(guild_id)
     # Stop current playback; worker will proceed to next item
     ctx.voice_client.stop()
     logger.info(f"Stopped current song for skip in guild {guild_id_str}")
@@ -1054,6 +1178,9 @@ async def handle_stop_request(ctx):
         preloaded_songs[guild_id] = None
         logger.info(f"Cleared preloaded song for guild {guild_id_str}")
     
+    # Mark as user-initiated so after callback doesn't trigger resume
+    user_stopping_guilds.add(guild_id)
+    interrupted_playback.pop(guild_id_str, None)
     # Now stop the current song - this will trigger play_next but queue is already empty
     ctx.voice_client.stop()
     
@@ -1607,7 +1734,7 @@ async def join(ctx):
         try:
             # Use a timeout for voice connection to prevent hanging with specific parameters
             voice_client = await asyncio.wait_for(
-                channel.connect(timeout=30, reconnect=False, cls=discord.VoiceClient), 
+                channel.connect(timeout=30, reconnect=True, cls=discord.VoiceClient),
                 timeout=15.0
             )
             logger.info(f"Successfully connected to voice channel {channel.name} in guild {ctx.guild.id}")
@@ -1773,6 +1900,11 @@ async def handle_play_request(ctx, search: str):
         logger.info(f"Bot not in voice channel, joining for guild {guild_id_str}")
         await ctx.invoke(join)
 
+    # Check for Suno playlist URLs (resolved to individual song URLs via the public API)
+    if is_suno_playlist_url(search):
+        logger.info(f"Detected Suno playlist URL: {search}")
+        return await handle_suno_playlist(ctx, search)
+
     # Check for Suno URLs first (direct CDN streaming, no YouTube needed)
     suno_id = is_suno_url(search)
     if suno_id:
@@ -1794,9 +1926,17 @@ async def handle_play_request(ctx, search: str):
             try:
                 player = await YTDLSource.from_suno_url(search)
                 current_song[guild_id_str] = player
-                ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(
-                    play_next(ctx), bot.loop
-                ) if not e else logger.error(f"Player error: {e}"))
+                def after_callback_suno(error):
+                    if error:
+                        logger.error(f"Suno playback error for {player.title}: {error}")
+                        player.cleanup()
+                    else:
+                        check_premature_end(player, ctx.guild.id)
+                        logger.info(f"Suno song finished normally: {player.title}")
+                        player.cleanup()
+                        asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
+                ctx.voice_client.play(player, after=after_callback_suno)
+                player.playback_started_at = time.time()
                 await update_music_message(ctx, player)
                 emit_to_guild(guild_id, 'song_update', {
                     'guild_id': guild_id_str,
@@ -1919,7 +2059,7 @@ async def handle_play_request(ctx, search: str):
                             try:
                                 logger.info(f"Attempting clean reconnection to {channel.name} for guild {guild_id_str} (attempt {reconnect_attempt + 1})")
                                 voice_client = await asyncio.wait_for(
-                                    channel.connect(timeout=30, reconnect=False, cls=discord.VoiceClient), 
+                                    channel.connect(timeout=30, reconnect=True, cls=discord.VoiceClient),
                                     timeout=15.0
                                 )
                                 if voice_client and voice_client.is_connected():
@@ -1989,9 +2129,10 @@ async def handle_play_request(ctx, search: str):
                             asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
                         else:
                             logger.warning(f"Connection-related error, not calling play_next: {error}")
+                            check_premature_end(player, ctx.guild.id)
                             player.cleanup()
                     else:
-                        # Song finished normally (or EOF reached)
+                        check_premature_end(player, ctx.guild.id)
                         logger.info(f"Song finished normally: {player.title}")
                         player.cleanup()
                         asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
@@ -2013,6 +2154,7 @@ async def handle_play_request(ctx, search: str):
                     logger.error(f"Player is invalid or has no original source!")
 
                 ctx.voice_client.play(player, after=after_callback)
+                player.playback_started_at = time.time()
                 logger.info(f"voice_client.play() called for {player.title}")
                 
                 # Set the current song and log it
@@ -2256,7 +2398,58 @@ async def play_next(ctx):
             
         # Don't clear the current song immediately - only clear it if we're actually moving to a new song
         # This prevents the song from being cleared when the after callback is triggered due to connection issues
-        
+
+        # Check if there's an interrupted song to resume
+        if guild_id_str in interrupted_playback:
+            resume_info = interrupted_playback.pop(guild_id_str)
+            seek_pos = resume_info['seek_seconds']
+            logger.info(f"Resuming interrupted song: {resume_info['title']} at {seek_pos:.0f}s")
+            try:
+                player = await YTDLSource.from_url(resume_info['url'], loop=bot.loop, stream=False, seek_seconds=seek_pos)
+
+                if not await ensure_voice_connection(ctx):
+                    logger.error(f"Failed to establish voice connection for resume in guild {guild_id_str}")
+                    playing_locks[guild_id] = False
+                    return
+
+                await asyncio.sleep(0.5)
+
+                if ctx.voice_client.is_playing():
+                    ctx.voice_client.stop()
+                    await asyncio.sleep(0.2)
+
+                def after_callback_resume(error):
+                    if error:
+                        logger.error(f"Resumed song playback error for {player.title}: {error}")
+                        if "timeout" not in str(error).lower() and "connection" not in str(error).lower():
+                            player.cleanup()
+                            asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
+                        else:
+                            check_premature_end(player, ctx.guild.id)
+                            player.cleanup()
+                    else:
+                        check_premature_end(player, ctx.guild.id)
+                        logger.info(f"Resumed song finished: {player.title}")
+                        player.cleanup()
+                        asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
+
+                ctx.voice_client.play(player, after=after_callback_resume)
+                player.playback_started_at = time.time()
+                current_song[guild_id_str] = player
+                logger.info(f"Resumed {player.title} at {seek_pos:.0f}s")
+
+                await update_music_message(ctx, player)
+                emit_to_guild(guild_id, 'song_update', {
+                    'guild_id': guild_id_str,
+                    'current_song': song_to_dict(player),
+                    'action': 'resume'
+                })
+                return
+            except Exception as e:
+                logger.error(f"Failed to resume interrupted song: {e}")
+                logger.error(traceback.format_exc())
+                # Fall through to normal play_next behavior
+
         # Check if we have a preloaded song
         if guild_id in preloaded_songs and preloaded_songs[guild_id]:
             player = preloaded_songs[guild_id]
@@ -2313,7 +2506,23 @@ async def play_next(ctx):
                         await asyncio.sleep(0.2)  # Small delay to ensure the previous song is fully stopped
                     
                     logger.info(f"Playing preloaded song in guild {guild_id_str}: {player.title}")
-                    ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop) if e is None else logger.error(f"Audio playback error: {e}"))
+                    def after_callback_preloaded(error):
+                        if error:
+                            logger.error(f"Preloaded song playback error for {player.title}: {error}")
+                            if "timeout" not in str(error).lower() and "connection" not in str(error).lower():
+                                player.cleanup()
+                                asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
+                            else:
+                                logger.warning(f"Connection-related error during preloaded song, not calling play_next: {error}")
+                                check_premature_end(player, ctx.guild.id)
+                                player.cleanup()
+                        else:
+                            check_premature_end(player, ctx.guild.id)
+                            logger.info(f"Preloaded song finished normally: {player.title}")
+                            player.cleanup()
+                            asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
+                    ctx.voice_client.play(player, after=after_callback_preloaded)
+                    player.playback_started_at = time.time()
                     current_song[guild_id_str] = player
                     logger.info(f"Set current_song[{guild_id_str}] to {player.title} (preloaded)")
                     
@@ -2426,9 +2635,10 @@ async def play_next(ctx):
                             asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
                         else:
                             logger.warning(f"Connection-related error, not calling play_next: {error}")
+                            check_premature_end(player, ctx.guild.id)
                             player.cleanup()
                     else:
-                        # Song finished normally
+                        check_premature_end(player, ctx.guild.id)
                         logger.info(f"Queued song finished normally: {player.title}")
                         player.cleanup()
                         asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
@@ -2436,6 +2646,7 @@ async def play_next(ctx):
                 # Add a small delay to ensure the source is ready
                 await asyncio.sleep(1.0)
                 ctx.voice_client.play(player, after=after_callback_queue)
+                player.playback_started_at = time.time()
                 current_song[guild_id_str] = player
                 logger.info(f"Set current_song[{guild_id_str}] to {player.title} (from queue)")
                 
@@ -2719,6 +2930,77 @@ async def handle_spotify_playlist(ctx, url):
         await ctx.send(f"🎵 Added {added_count} songs from Spotify {type_name} to the queue.")
 
 
+async def handle_suno_playlist(ctx, url):
+    """Handle a Suno playlist URL by resolving its songs and queuing them.
+
+    Each resolved song is queued as its individual Suno song URL, so the existing
+    Suno playback path (is_suno_url -> from_suno_url) plays them unchanged.
+    """
+    logger.info(f"Handling Suno playlist URL: {url}")
+    guild_id = ctx.guild.id
+    guild_id_str = str(guild_id)
+
+    # Ensure bot is connected to voice channel
+    if not ctx.voice_client:
+        logger.info(f"Bot not in voice channel, joining for Suno playlist in guild {guild_id_str}")
+        await ctx.invoke(join)
+
+    await ctx.send("🎵 Processing Suno playlist...")
+
+    songs = await scrape_suno_playlist(url)
+    if not songs:
+        await ctx.send("❌ Could not load Suno playlist. It may be private, empty, or unavailable.")
+        return "Error: Could not load Suno playlist."
+
+    # Initialize queue if needed
+    if guild_id_str not in queues:
+        queues[guild_id_str] = deque()
+        logger.info(f"Created new queue for guild {guild_id_str}")
+
+    # Add songs to queue with deduplication. The playlist API already gave us each
+    # song's title/audio_url/thumbnail, so pre-seed the cache to render the queue
+    # instantly without re-fetching every song page.
+    unique_urls = set()
+    added_count = 0
+    for song in songs:
+        song_url = song['webpage_url']
+        if song_url in unique_urls:
+            continue
+        unique_urls.add(song_url)
+        song_cache[song_url] = {
+            'title': song['title'],
+            'webpage_url': song_url,
+            'url': song['audio_url'],
+            'thumbnail': song['thumbnail'],
+        }
+        queues[guild_id_str].append(song_url)
+        added_count += 1
+
+    if added_count == 0:
+        await ctx.send("❌ No valid songs found in the Suno playlist.")
+        return "Error: No valid songs found in the Suno playlist."
+
+    logger.info(f"Added {added_count} songs from Suno playlist to queue for guild {guild_id_str}")
+
+    # Fix queue to remove duplicates
+    await fix_queue(guild_id)
+
+    # Emit queue update for dashboard
+    emit_to_guild(guild_id, 'queue_update', {
+        'guild_id': guild_id_str,
+        'queue': queue_to_list(guild_id_str),
+        'action': 'add_playlist'
+    })
+
+    # Start playback if not already playing
+    if not ctx.voice_client or not ctx.voice_client.is_playing():
+        await play_next(ctx)
+    else:
+        await ctx.send(f"🎵 Added {added_count} songs from the Suno playlist to the queue.")
+
+    return f"🎵 Added {added_count} songs from the Suno playlist to the queue."
+
+
 async def handle_playlist(ctx, url):
     """Handles the playlist and queues each song."""
     logger.info(f"Handling playlist URL: {url}")
@@ -2997,7 +3279,7 @@ async def ensure_voice_connection(ctx, max_retries=3):
             for conn_attempt in range(connection_retries):
                 try:
                     voice_client = await asyncio.wait_for(
-                        channel.connect(timeout=30, reconnect=False, cls=discord.VoiceClient), 
+                        channel.connect(timeout=30, reconnect=True, cls=discord.VoiceClient),
                         timeout=15.0
                     )
                     break
@@ -3112,10 +3394,13 @@ async def on_voice_state_update(member, before, after):
                 logger.info(f"Resetting playing lock in guild {guild_id}")
                 playing_locks[guild_id] = False
             
-            # Try to reconnect and continue playback if there's a queue
-            if guild_id in queues and queues[str(guild_id)] and len(queues[str(guild_id)]) > 0:
-                logger.info(f"Queue exists for guild {guild_id}, attempting reconnection")
-                
+            # Try to reconnect and continue playback if there's a queue or interrupted song
+            guild_id_str = str(guild_id)
+            has_queue = guild_id in queues and queues.get(guild_id_str) and len(queues[guild_id_str]) > 0
+            has_interrupted = guild_id_str in interrupted_playback
+            if has_queue or has_interrupted:
+                logger.info(f"{'Queue' if has_queue else 'Interrupted song'} exists for guild {guild_id}, attempting reconnection")
+
                 # Create a fake context for reconnection
                 guild = bot.get_guild(guild_id)
                 if guild:
@@ -3713,6 +3998,24 @@ def play_song(guild_id):
     if guild_id not in queues:
         queues[guild_id] = deque()
     
+    # Check for Suno playlist URLs (resolved to individual song URLs via the public API)
+    if is_suno_playlist_url(search):
+        logger.info(f"API: Detected Suno playlist URL: {search}")
+        try:
+            async def run_suno_playlist_handler():
+                return await handle_suno_playlist(fake_ctx, search)
+
+            future = asyncio.run_coroutine_threadsafe(run_suno_playlist_handler(), bot.loop)
+            future.result(timeout=30)
+            return jsonify({"success": True, "message": "Suno playlist added to queue"}), 200
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout handling Suno playlist in API endpoint: {search}")
+            return jsonify({"error": "Suno playlist processing timed out. Try a smaller playlist."}), 408
+        except Exception as e:
+            logger.error(f"Error handling Suno playlist in API endpoint: {e}")
+            logger.error(traceback.format_exc())
+            return jsonify({"error": f"Error processing Suno playlist URL: {str(e)}"}), 500
+
     # Check for Suno URLs first (direct CDN streaming)
     suno_id = is_suno_url(search)
     if suno_id:
