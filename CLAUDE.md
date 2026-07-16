@@ -76,6 +76,8 @@ ELEVENLABS_API_KEY=your_key_here  # Optional, for TTS
 ELEVENLABS_VOICE_ID=your_voice_id_here  # Optional, for TTS
 SPOTIFY_CLIENT_ID=your_spotify_client_id_here  # Optional, for Spotify URL support
 SPOTIFY_CLIENT_SECRET=your_spotify_client_secret_here  # Optional, for Spotify URL support
+MONITORED_CHANNEL_IDS=650800022954180620  # Optional, comma-separated channel IDs to auto-repost X/Twitter videos in (defaults to #geral)
+MAX_MEDIA_UPLOAD_MB=10  # Optional, max size (MB) for raw video upload before falling back to an inline-preview link
 ```
 
 ## Testing Strategy

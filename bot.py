@@ -98,6 +98,17 @@ except ImportError:
 except Exception as e:
     logger.error(f"Error initializing Spotify client: {e}")
 
+# X/Twitter media repost feature configuration
+# Channels (comma-separated IDs) where posted X/Twitter links are auto-reposted as raw video.
+# Defaults to the #geral channel; override via env to add or change channels.
+MONITORED_CHANNEL_IDS = {
+    int(c) for c in os.getenv("MONITORED_CHANNEL_IDS", "650800022954180620").split(",") if c.strip()
+}
+# Max size (MB) for a video to be uploaded as a raw file. Larger videos fall back to an inline-preview link.
+MAX_MEDIA_UPLOAD_MB = int(os.getenv("MAX_MEDIA_UPLOAD_MB", "10"))
+if MONITORED_CHANNEL_IDS:
+    logger.info(f"X/Twitter repost enabled for channel(s): {sorted(MONITORED_CHANNEL_IDS)}")
+
 # Create a PID file to indicate that the bot is running
 def create_pid_file():
     """Create a PID file for the bot to allow detection by other processes"""
@@ -829,6 +840,162 @@ def is_suno_playlist_url(text):
     return match.group(1) if match else None
 
 
+# 🐦 X/Twitter media repost helpers 🐦
+
+# Matches x.com / twitter.com status links, capturing (username, tweet_id).
+# The scheme is required to avoid false positives on substrings like "netflix.com".
+TWITTER_STATUS_RE = re.compile(
+    r'https?://(?:www\.|mobile\.)?(?:twitter\.com|x\.com)/(\w+)/status/(\d+)',
+    re.IGNORECASE,
+)
+
+
+def find_twitter_urls(text):
+    """Find all X/Twitter status links in a message.
+
+    Returns a list of (username, tweet_id, original_url) tuples; empty if none.
+    """
+    if not text:
+        return []
+    return [
+        (match.group(1), match.group(2), match.group(0))
+        for match in TWITTER_STATUS_RE.finditer(text)
+    ]
+
+
+async def fetch_twitter_videos(username, tweet_id):
+    """Resolve direct video URLs for a tweet via the fxtwitter/vxtwitter APIs.
+
+    These public APIs return media without requiring login or cookies. Returns a
+    list of direct .mp4 URLs (empty if the tweet has no video, e.g. image-only).
+    """
+    headers = {'User-Agent': 'Mozilla/5.0 (compatible; sacudo-bot/1.0)'}
+    timeout = aiohttp.ClientTimeout(total=15)
+
+    # Primary: fxtwitter API -> tweet.media.videos[] where type == "video"
+    fx_url = f"https://api.fxtwitter.com/{username}/status/{tweet_id}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(fx_url, headers=headers, timeout=timeout) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    media = (data.get('tweet') or {}).get('media') or {}
+                    videos = [
+                        v.get('url') for v in (media.get('videos') or [])
+                        if v.get('type') == 'video' and v.get('url')
+                    ]
+                    if videos:
+                        return videos
+    except Exception as e:
+        logger.warning(f"fxtwitter lookup failed for {username}/{tweet_id}: {e}")
+
+    # Fallback: vxtwitter API -> media_extended[] where type == "video"
+    vx_url = f"https://api.vxtwitter.com/{username}/status/{tweet_id}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(vx_url, headers=headers, timeout=timeout) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    videos = [
+                        m.get('url') for m in (data.get('media_extended') or [])
+                        if m.get('type') == 'video' and m.get('url')
+                    ]
+                    if videos:
+                        return videos
+    except Exception as e:
+        logger.warning(f"vxtwitter lookup failed for {username}/{tweet_id}: {e}")
+
+    return []
+
+
+def _safe_remove(path):
+    """Remove a file if it exists, ignoring errors."""
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except Exception as e:
+        logger.error(f"Error removing temp file {path}: {e}")
+
+
+async def download_capped(url, dest_path, max_bytes):
+    """Stream-download a URL to dest_path, aborting if it exceeds max_bytes.
+
+    Returns True if fully downloaded within the size cap, otherwise False
+    (removing any partial file).
+    """
+    headers = {'User-Agent': 'Mozilla/5.0 (compatible; sacudo-bot/1.0)'}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                if resp.status != 200:
+                    logger.warning(f"Media download HTTP {resp.status} for {url}")
+                    return False
+                # Trust Content-Length when present to skip oversized downloads early.
+                content_length = resp.headers.get('Content-Length')
+                if content_length and int(content_length) > max_bytes:
+                    return False
+                downloaded = 0
+                with open(dest_path, 'wb') as f:
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        downloaded += len(chunk)
+                        if downloaded > max_bytes:
+                            _safe_remove(dest_path)
+                            return False
+                        f.write(chunk)
+        return True
+    except Exception as e:
+        logger.warning(f"Error downloading media {url}: {e}")
+        _safe_remove(dest_path)
+        return False
+
+
+async def repost_twitter_media(message):
+    """Extract videos from any X/Twitter links in a message and repost them.
+
+    Uploads each tweet's videos as raw file replies when they fit Discord's
+    upload cap; otherwise replies with an fxtwitter inline-preview link that
+    renders playable. Image-only tweets (no video) are silently skipped.
+    """
+    max_bytes = MAX_MEDIA_UPLOAD_MB * 1024 * 1024
+    for username, tweet_id, original_url in find_twitter_urls(message.content):
+        try:
+            video_urls = await fetch_twitter_videos(username, tweet_id)
+            if not video_urls:
+                continue  # image-only tweet or extraction failed -> skip
+
+            # Download to temp files first; only build discord.File objects once
+            # we know they all fit (avoids dangling open handles on Windows).
+            temp_paths = []
+            all_fit = True
+            try:
+                for index, video_url in enumerate(video_urls):
+                    temp_path = f"x_{tweet_id}_{index}_{uuid.uuid4().hex}.mp4"
+                    if await download_capped(video_url, temp_path, max_bytes):
+                        temp_paths.append(temp_path)
+                    else:
+                        all_fit = False
+                        break  # too big/failed -> post the inline link instead
+
+                if all_fit and temp_paths:
+                    files = [
+                        discord.File(p, filename=f"{tweet_id}_{i}.mp4")
+                        for i, p in enumerate(temp_paths[:10])  # Discord: max 10 attachments
+                    ]
+                    await message.reply(files=files, mention_author=False)
+                else:
+                    await message.reply(
+                        f"https://fxtwitter.com/{username}/status/{tweet_id}",
+                        mention_author=False,
+                    )
+            finally:
+                for path in temp_paths:
+                    _safe_remove(path)
+        except discord.HTTPException as e:
+            logger.error(f"Discord error reposting {original_url}: {e}")
+        except Exception as e:
+            logger.error(f"Error reposting X/Twitter media for {original_url}: {e}")
+
+
 async def scrape_suno_song(url):
     """Scrape song metadata and audio URL from a Suno song page.
 
@@ -1275,6 +1442,17 @@ async def on_ready():
     # Store the bot startup time
     bot.uptime = time.time()
     logger.info("Bot is ready!")
+
+@bot.event
+async def on_message(message):
+    """Watch monitored channels and auto-repost X/Twitter videos as raw files."""
+    # Skip messages from bots (including ourselves) to avoid reacting to reposts.
+    if not message.author.bot and message.channel.id in MONITORED_CHANNEL_IDS:
+        if find_twitter_urls(message.content):
+            # Run in the background so we don't block command/message processing.
+            asyncio.create_task(repost_twitter_media(message))
+    # IMPORTANT: keep prefix commands (e.g. !play, !talk) working.
+    await bot.process_commands(message)
 
 @bot.event
 async def on_error(event, *args, **kwargs):
@@ -4751,6 +4929,14 @@ def _after_tts(error, filename, resume_after, voice_client):
             os.remove(filename)
     except Exception as e:
         logger.error(f"Error removing TTS file {filename}: {e}")
+
+@bot.command(name="xtest")
+async def xtest(ctx, url: str):
+    """Test X/Twitter video extraction on a link without needing a real post."""
+    if not find_twitter_urls(url):
+        return await ctx.send("❌ Not a recognized X/Twitter status URL.")
+    await ctx.send("⏳ Extracting media...")
+    await repost_twitter_media(ctx.message)
 
 @bot.command()
 async def voice_debug(ctx):
