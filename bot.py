@@ -840,6 +840,45 @@ def is_suno_playlist_url(text):
     return match.group(1) if match else None
 
 
+def is_suno_short_url(text):
+    """Check if the provided text is a Suno share/short link (suno.com/s/<id>).
+
+    These share links redirect to the canonical /song/<uuid> page. The share id
+    is NOT the song UUID, so it must be resolved before the Suno scraping/CDN
+    path can use it. Returns the short id or None.
+    """
+    if not text:
+        return None
+    match = re.search(r'(?:https?://)?(?:www\.)?suno\.com/s/([A-Za-z0-9]+)', text)
+    return match.group(1) if match else None
+
+
+async def resolve_suno_short_url(url):
+    """Resolve a Suno share link (suno.com/s/<id>) to its canonical song URL.
+
+    Follows the redirect to the /song/<uuid> page and returns
+    'https://suno.com/song/<uuid>', or None on failure.
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }) as response:
+                final_url = str(response.url)  # after redirects: /song/<uuid>?sh=...
+                html = await response.text()
+    except Exception as e:
+        logger.error(f"Error resolving Suno short link {url}: {e}")
+        return None
+
+    # Prefer the UUID from the redirected URL, fall back to scanning the page body.
+    match = (re.search(r'/song/([a-f0-9-]{36})', final_url)
+             or re.search(r'/song/([a-f0-9-]{36})', html))
+    if not match:
+        logger.error(f"Could not find canonical song UUID for Suno short link {url}")
+        return None
+    return f"https://suno.com/song/{match.group(1)}"
+
+
 # 🐦 X/Twitter media repost helpers 🐦
 
 # Matches x.com / twitter.com status links, capturing (username, tweet_id).
@@ -2077,6 +2116,16 @@ async def handle_play_request(ctx, search: str):
     if not ctx.voice_client:
         logger.info(f"Bot not in voice channel, joining for guild {guild_id_str}")
         await ctx.invoke(join)
+
+    # Resolve Suno share links (suno.com/s/<id>) to their canonical /song/<uuid> URL
+    # so the normal Suno detection/playback path below can handle them.
+    if is_suno_short_url(search):
+        resolved = await resolve_suno_short_url(search)
+        if resolved:
+            logger.info(f"Resolved Suno short link {search} -> {resolved}")
+            search = resolved
+        else:
+            return "❌ Could not resolve that Suno share link. Try the full song URL (suno.com/song/...)."
 
     # Check for Suno playlist URLs (resolved to individual song URLs via the public API)
     if is_suno_playlist_url(search):

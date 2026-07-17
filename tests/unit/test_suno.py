@@ -25,6 +25,45 @@ class TestSunoURLDetection(unittest.TestCase):
         )
         return match.group(1) if match else None
 
+    def _is_suno_short_url(self, text):
+        """Local implementation of is_suno_short_url for testing."""
+        if not text:
+            return None
+        match = re.search(r'(?:https?://)?(?:www\.)?suno\.com/s/([A-Za-z0-9]+)', text)
+        return match.group(1) if match else None
+
+    # --- is_suno_short_url (share/short link) tests ---
+
+    def test_short_url_returns_id(self):
+        """A Suno share link returns its short id."""
+        self.assertEqual(
+            self._is_suno_short_url("https://suno.com/s/vXz3LYOONRYS0kPm"),
+            "vXz3LYOONRYS0kPm",
+        )
+
+    def test_short_url_mixed_case_id(self):
+        """Short ids are mixed-case alphanumeric (not hex UUIDs)."""
+        self.assertEqual(self._is_suno_short_url("https://suno.com/s/AbC123xyz")[:3], "AbC")
+
+    def test_song_url_is_not_a_short_url(self):
+        """A canonical /song/<uuid> URL must not be detected as a share link."""
+        self.assertIsNone(self._is_suno_short_url(
+            "https://suno.com/song/ba997815-77ae-497f-8ad2-67f31dc5dbff"
+        ))
+
+    def test_short_url_is_not_a_song_url(self):
+        """A share link must not be picked up by the /song/<uuid> detector (root cause)."""
+        self.assertIsNone(self._is_suno_url("https://suno.com/s/vXz3LYOONRYS0kPm"))
+
+    def test_short_url_empty_and_none(self):
+        self.assertIsNone(self._is_suno_short_url(""))
+        self.assertIsNone(self._is_suno_short_url(None))
+
+    def test_short_url_youtube_returns_none(self):
+        self.assertIsNone(self._is_suno_short_url(
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        ))
+
     # --- is_suno_playlist_url tests ---
 
     def test_playlist_url(self):
